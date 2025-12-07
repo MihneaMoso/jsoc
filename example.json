@@ -1,11 +1,11 @@
 [
-  {
-    "foo": "bar"
-  },
-  {
-    
-  },
-  {
-    
-  }
+    {
+        "foo": "bar",
+        "bin": "baz"
+    },
+    {},
+    {},
+    { "test": "hello" }
 ]
+
+{'test': 'hello'}
