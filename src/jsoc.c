@@ -4,9 +4,26 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <cstdint>
+#include <stdint.h>
 
 #define MAX_READ 1024 * 50
+
+// Dynamic array
+typedef struct Node {
+    int val;
+    struct Node* next;
+} Node;
+
+typedef enum {
+    OPEN_CURLY,
+    CLOSED_CURLY,
+    OPEN_PAREN,
+    CLOSED_PAREN,
+    OPEN_BRACKET,
+    CLOSED_BRACKET,
+    NUMBER,
+    STRING,
+} Token;
 
 void writeStringToFile(const char *string, const char *filename)
 {
@@ -32,9 +49,9 @@ void appendStringToFile(const char *string, const char *filename)
     fclose(fp);
 }
 
-bool readFileIntoBuffer(char *buffer, const char *filename)
+bool readFileIntoBuffer(char **buffer, const char *filename)
 {
-    buffer = 0;
+    *buffer = NULL;
     int64_t length = 0;
     FILE *fp = fopen(filename, "rb");
     if (!fp)
@@ -45,35 +62,38 @@ bool readFileIntoBuffer(char *buffer, const char *filename)
     fseek(fp, 0, SEEK_END);
     length = ftell(fp);
     fseek(fp, 0, SEEK_SET);
-    buffer = malloc(length);
+
+    // Allocate buffer with space for null terminator
+    *buffer = malloc(length + 1);
     // why can't we do
     // defer free(buffer);
     // like in zig!?
-    if (!buffer)
+    if (!*buffer)
     {
-        perror("Could't allocate using malloc\n");
+        perror("Couldn't allocate using malloc\n");
+        fclose(fp);
         return false;
     }
-    fread(buffer, 1, length, fp);
+    fread(*buffer, 1, length, fp);
+    (*buffer)[length] = '\0'; // Null terminate
     fclose(fp);
+    return true; // Success!
 }
 
-int main()
+void printString(char *string)
 {
-    const char *filename = "example.json";
-    FILE *fp = fopen(filename, "r+");
-    if (!fp)
+    size_t len = strlen(string);
+    for (size_t i = 0; i < len; i++)
     {
-        perror("Error reading file :(");
-        return EXIT_FAILURE;
+        putchar(string[i]);
     }
+}
 
-    appendStringToFile("\n{'test': 'hello'}", filename);
-
-    int c;
-    while ((c = fgetc(fp)) != EOF)
+void tokenizeJSON(char *buffer, size_t length, Token* tokens)
+{
+    for (size_t i = 0; i < length; i++)
     {
-        char ch = c;
+        char ch = buffer[i];
         switch (ch)
         {
         case '{':
@@ -96,19 +116,37 @@ int main()
         }
         }
     }
+}
 
-    if (ferror(fp)) {
+int main()
+{
+    const char *filename = "example.json";
+    Token tokens[] = {0};
+    
+    char* buffer;
+    readFileIntoBuffer(&buffer ,filename);
+    printString(buffer);
+    size_t buf_length = strlen(buffer);
+    tokenizeJSON(buffer, buf_length, tokens);
 
-        puts("I/O error when reading");
-    }
-    else if (feof(fp))
-    {
-        // puts("End of file is reached successfully");
-        return EXIT_SUCCESS;
-    }
+    free(buffer);
 
-    fclose(fp);
-    // remove(filename);
-    // printf("Hello, World\n");
+
+    // Flush stdout to ensure output is displayed
+    // fflush(stdout);
+
+    // if (ferror(fp))
+    // {
+
+    //     puts("I/O error when reading");
+    // }
+    // else if (feof(fp))
+    // {
+    //     // puts("End of file is reached successfully");
+    //     fclose(fp);
+    //     return EXIT_SUCCESS;
+    // }
+
+
     return 0;
 }
