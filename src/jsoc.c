@@ -6,13 +6,9 @@
 #include <string.h>
 #include <stdint.h>
 
-#define MAX_READ 1024 * 50
+#include "dynarray.h"
 
-// Dynamic array
-typedef struct Node {
-    int val;
-    struct Node* next;
-} Node;
+#define MAX_READ 1024 * 50
 
 typedef enum {
     OPEN_CURLY,
@@ -89,23 +85,42 @@ void printString(char *string)
     }
 }
 
-void tokenizeJSON(char *buffer, size_t length, Token* tokens)
+void tokenizeJSON(char *buffer, size_t length, dynarray_t* tokens)
 {
     for (size_t i = 0; i < length; i++)
     {
+        Token token;
         char ch = buffer[i];
         switch (ch)
         {
         case '{':
         {
-            putchar(ch);
-            putchar(' ');
+            token = OPEN_CURLY;
             break;
         }
         case '}':
         {
-            putchar(ch);
-            putchar(' ');
+            token = CLOSED_CURLY;
+            break;
+        }
+        case '(':
+        {
+            token = OPEN_PAREN;
+            break;
+        }
+        case ')':
+        {
+            token = CLOSED_PAREN;
+            break;
+        }
+        case '[':
+        {
+            token = OPEN_BRACKET;
+            break;
+        }
+        case ']':
+        {
+            token = CLOSED_BRACKET;
             break;
         }
         default:
@@ -115,22 +130,32 @@ void tokenizeJSON(char *buffer, size_t length, Token* tokens)
             break;
         }
         }
+        da_push(tokens, (Token*) token);
     }
 }
 
 int main()
 {
     const char *filename = "example.json";
-    Token tokens[] = {0};
+    dynarray_t* tokens = da_create(sizeof(Token), 256, NULL);
     
     char* buffer;
     readFileIntoBuffer(&buffer ,filename);
     printString(buffer);
     size_t buf_length = strlen(buffer);
-    tokenizeJSON(buffer, buf_length, tokens);
+    // tokenizeJSON(buffer, buf_length, tokens);
 
+    for (int i = 0; i < 100; i++) {
+        da_push(tokens, &i);
+    }
+    size_t da_len = da_size(tokens);
+    for (size_t i = 0; i < da_len; i++) {
+        int elem = *(int*) da_get(tokens, i);
+        printf("Element nr %zu is %i\n", i, elem);
+    }
+    
     free(buffer);
-
+    da_free(tokens);
 
     // Flush stdout to ensure output is displayed
     // fflush(stdout);

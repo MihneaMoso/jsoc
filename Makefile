@@ -18,7 +18,7 @@ shared: $(OBJ)
 	$(CC) -shared -o build/lib$(LIBNAME).so $(OBJ)
 	
 test: src/jsoc.c
-	$(CC) -o build/jsoc src/jsoc.c
+	$(CC) -o build/jsoc src/jsoc.c src/dynarray.c
 	./build/jsoc
 
 clean:
