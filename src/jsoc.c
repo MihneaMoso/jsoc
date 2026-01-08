@@ -15,6 +15,7 @@ typedef enum {
     // CLOSED_PAREN,
     OPEN_BRACKET, // or ARRAY_START
     CLOSED_BRACKET,
+    COMMA,
     NUMBER,
     STRING,
     UNKNOWN
@@ -42,6 +43,10 @@ typedef enum {
 bool is_hex(char c) {
     c = tolower(c);
     return (c == 'a') || (c == 'b') || (c == 'c') || (c == 'd') || (c == 'e') || (c == 'f') || ((0 <= c - '0') && (c - '0' <= 9));
+}
+
+bool is_value(const char* str) {
+    return false;
 }
 
 // tokenizes buffer into tokens array then returns number of tokens
@@ -77,10 +82,18 @@ int tokenizeJSON(char *buffer, Token* tokens, int max_tokens)
                 } else if (*ptr == '[') {
                     state = STATE_IN_ARRAY;
                     tokens[token_count].type = OPEN_BRACKET; // FUCK
+                    ptr++; // Skip opening bracket
                     // temp_idx = 0;
+                } else if (*ptr == ',') {
+                    // assert that we are inside an array
+                    // or an object
+                    // probably will be done by the parser tho
+                    tokens[token_count].type = COMMA;
+                    ptr++; // Skip comma
                 } else if (*ptr == '{') {
                     state = STATE_IN_OBJECT;
                     tokens[token_count].type = OPEN_CURLY;
+                    ptr++; // Skip opening curly
                     // temp_idx = 0;
                 }
                 break;
@@ -127,12 +140,20 @@ int tokenizeJSON(char *buffer, Token* tokens, int max_tokens)
             }
 
             case STATE_IN_STRING: {
-                if (*ptr == '\\') { /* TODO: handle case where \\\\\\\\ */
+                if (*ptr == '\\') { /* TODO: handle case where \\\\\\\\ -> Only even amount of \'s allowed */
                     char next = *(ptr + 1);
-                    if (next == '\0') { // \ is the last character of the buffer
+                    char* next_ptr = ptr + 1;
+                    int backslash_count = 1, i = 0;
+                    while (*(next_ptr + i) == '\\') {
+                        backslash_count++;
+                        i++;
+                    }
+                    if (backslash_count % 2 != 0) {
                         state = STATE_IN_UNKNOWN;
                         break;
                     }
+                    // The number of backslashes will be halved after this
+                    
                     if (next == '"' ||
                         next == '/' ||
                         next == '\\' ||
@@ -149,7 +170,7 @@ int tokenizeJSON(char *buffer, Token* tokens, int max_tokens)
                         break;
                     }
                 }
-                if (*ptr == '"' && *(ptr - 1) != '\\') {
+                if (*ptr == '"' && *(ptr - 1) != 0x5c) { // 0x5c == '\'
                     temp[temp_idx] = '\0';
                     tokens[token_count].type = STRING;
                     strcpy(tokens[token_count].value, temp);
@@ -163,13 +184,14 @@ int tokenizeJSON(char *buffer, Token* tokens, int max_tokens)
             }
 
             case STATE_IN_ARRAY: {
+                if (*ptr) {}
                 if (*ptr == ']') {
                     state = STATE_START;
                     ptr++; // Skip closing bracket
                     tokens[token_count].type = CLOSED_BRACKET;
                     token_count++;
                 } else {
-                    ptr++;
+                    state = STATE_START;
                 }
                 break;
             }
@@ -211,7 +233,7 @@ int main()
     size_t buf_length = strlen(buffer);
 
 
-    Token tokens[buf_length]; // potentially dangerous ⚠️
+    Token tokens[buf_length]; // VLA: potentially dangerous ⚠️
     // tokenizeJSON(buffer, buf_length, tokens);
 
     // for (int i = 0; i < 100; i++) {
