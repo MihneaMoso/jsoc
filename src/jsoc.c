@@ -41,6 +41,12 @@ typedef enum {
     STATE_IN_UNKNOWN
 } TokenizerState;
 
+typedef struct {
+    Token* items;
+    size_t count;
+    size_t capacity;
+} Tokens;
+
 // typedef struct {
 //     int pos, col, row;
 // } Cur;
@@ -67,208 +73,136 @@ bool is_value(const char* str) {
 }
 
 // tokenizes buffer into tokens array then returns number of tokens
-int tokenizeJSON(char *buffer, Token* tokens, int max_tokens)
+int tokenizeJSON(char *buffer, Tokens *tokens, int max_tokens)
 {
-    int line = 1, col = 1;
     char* ptr = buffer;
     TokenizerState state = STATE_START;
     int token_count = 0;
     char temp[256];
-    int temp_idx;
-    int line_count = 0, col_pos = 0;
-
-    // int token
+    int temp_idx = 0;
+    
     while (*ptr != '\0' && token_count < max_tokens)
     {
-        bool is_minus = false;
-        bool is_period = false;
-        if (*ptr == '\n') {
-            line_count++;
-            col_pos = 0;
+        // Skip whitespace
+        if (state == STATE_START && isspace(*ptr)) {
+            ptr++;
+            continue;
         }
-        
+
         switch (state) {
             case STATE_START: {
-                if (isspace(*ptr)) ptr++; // handled WHITESPACE
-
-                else if (isdigit(*ptr) || *ptr == '-') {
+                if (isdigit(*ptr) || *ptr == '-') {
                     state = STATE_IN_NUMBER;
                     temp_idx = 0;
-                    if (*ptr == '-') {
-                        is_minus = true;
-                        temp[temp_idx++] = *ptr++;
-                    }
+                    temp[temp_idx++] = *ptr++;
                 } else if (*ptr == '"') {
                     state = STATE_IN_STRING;
                     temp_idx = 0;
-                    ptr++; // Skip opening quote
+                    ptr++; 
                 } else if (*ptr == '[') {
-                    state = STATE_IN_ARRAY;
-                    tokens[token_count++].type = JSON_OBRACKET; // FUCK
-                    ptr++; // Skip opening bracket
-                    // temp_idx = 0;
+                    tokens->items[token_count].type = JSON_OBRACKET;
+                    tokens->items[token_count].value[0] = '\0';
+                    token_count++;
+                    ptr++;
                 } else if (*ptr == ',') {
-                    // assert that we are inside an array
-                    // or an object
-                    // probably will be done by the parser tho
-                    tokens[token_count++].type = JSON_COMMA;
-                    ptr++; // Skip comma
+                    tokens->items[token_count].type = JSON_COMMA;
+                    tokens->items[token_count].value[0] = '\0';
+                    token_count++;
+                    ptr++;
+                } else if (*ptr == ':') {
+                    // Skip colon as it is not a required token in this tokenizer's design
+                    ptr++;
                 } else if (*ptr == '{') {
-                    state = STATE_IN_OBJECT;
-                    tokens[token_count++].type = JSON_OCURLY;
-                    ptr++; // Skip opening curly
-                    // temp_idx = 0;
-                } else if (*ptr == 't') { // true
-                    state = STATE_IN_TRUE;
-                    tokens[token_count].type = JSON_TRUE;
-                } else if (*ptr == 'f') { // false
-                    state = STATE_IN_FALSE;
-                    tokens[token_count].type = JSON_FALSE;
-                } else if (*ptr == 'n') { // null
-                    state = STATE_IN_NULL;
-                    tokens[token_count].type = JSON_NULL;
+                    tokens->items[token_count].type = JSON_OCURLY;
+                    tokens->items[token_count].value[0] = '\0';
+                    token_count++;
+                    ptr++;
+                } else if (*ptr == ']') {
+                    tokens->items[token_count].type = JSON_CBRACKET;
+                    tokens->items[token_count].value[0] = '\0';
+                    token_count++;
+                    ptr++;
+                } else if (*ptr == '}') {
+                    tokens->items[token_count].type = JSON_CCURLY;
+                    tokens->items[token_count].value[0] = '\0';
+                    token_count++;
+                    ptr++;
+                } else if (*ptr == 't') {
+                    if (strncmp(ptr, "true", 4) == 0) {
+                        tokens->items[token_count].type = JSON_TRUE;
+                        strncpy(tokens->items[token_count].value, "true", 4);
+                        tokens->items[token_count].value[4] = '\0';
+                        token_count++;
+                        ptr += 4;
+                    } else {
+                        state = STATE_IN_UNKNOWN;
+                    }
+                } else if (*ptr == 'f') {
+                    if (strncmp(ptr, "false", 5) == 0) {
+                        tokens->items[token_count].type = JSON_FALSE;
+                        strncpy(tokens->items[token_count].value, "false", 5);
+                        tokens->items[token_count].value[5] = '\0';
+                        token_count++;
+                        ptr += 5;
+                    } else {
+                        state = STATE_IN_UNKNOWN;
+                    }
+                } else if (*ptr == 'n') {
+                    if (strncmp(ptr, "null", 4) == 0) {
+                        tokens->items[token_count].type = JSON_NULL;
+                        strncpy(tokens->items[token_count].value, "null", 4);
+                        tokens->items[token_count].value[4] = '\0';
+                        token_count++;
+                        ptr += 4;
+                    } else {
+                        state = STATE_IN_UNKNOWN;
+                    }
                 } else {
                     state = STATE_IN_UNKNOWN;
-                    tokens[token_count].type = UNKNOWN;
                 }
                 break;
             }
             case STATE_IN_NUMBER: {
-                if (is_minus) {
-                    state = STATE_IN_UNKNOWN;
-                    break;
-                }
-                if (is_period) {
-                    state = STATE_IN_UNKNOWN;
-                    break;
-                }
-
-                if (*ptr == '.') {
-                    is_period = true;
-                    temp[temp_idx++] = *ptr++;
-                } else if (*ptr == 'e' || *ptr == 'E') { // Exponent
-                    char next = *(ptr + 1);
-                    if (next != '-' && next != '+') {
-                        state = STATE_IN_UNKNOWN;
-                        break;
-                    }
-                    
-                    // 1 or more digits
-                    char next2 = *(ptr + 2);
-                    if (!isdigit(next2)) {
-                        state = STATE_IN_UNKNOWN;
-                        break;
-                    }
-                    
-                    temp[temp_idx++] = *ptr++;
-                    
-                } else if (isdigit(*ptr)) {
+                if (isdigit(*ptr) || *ptr == '.' || *ptr == 'e' || *ptr == 'E' || *ptr == '+' || *ptr == '-') {
                     temp[temp_idx++] = *ptr++;
                 } else {
                     temp[temp_idx] = '\0';
-                    tokens[token_count].type = JSON_NUMBER;
-                    strcpy(tokens[token_count].value, temp);
+                    tokens->items[token_count].type = JSON_NUMBER;
+                    strncpy(tokens->items[token_count].value, temp, 255);
                     token_count++;
                     state = STATE_START;
                 }
                 break;
             }
-
             case STATE_IN_STRING: {
-                if (*ptr == '\\') { /* TODO: handle case where \\\\\\\\ -> Only even amount of \'s allowed */
-                    char next = *(ptr + 1);
-                    char* next_ptr = ptr + 1;
-                    int backslash_count = 1, i = 0;
-                    while (*(next_ptr + i) == '\\') {
-                        backslash_count++;
-                        i++;
-                    }
-                    if (backslash_count % 2 != 0) {
-                        state = STATE_IN_UNKNOWN;
-                        break;
-                    }
-                    // The number of backslashes will be halved after this
-                    
-                    if (next == '"' ||
-                        next == '/' ||
-                        next == '\\' ||
-                        next == 'b' ||
-                        next == 'f' ||
-                        next == 'n' ||
-                        next == 'r' ||
-                        next == 't' ||
-                        (next == 'u' && is_hex(*(ptr + 2)) && is_hex(*(ptr + 3)) && is_hex(*(ptr + 4)) && is_hex(*(ptr + 5)))) { // u followed by 4 hex digits => unicode code point
-                        ptr++; // Skip the backslash \ character and just increment the pointer, the string will contain the escaped symbol
-                    }
-                    else { // We have \ but no valid escape characters
-                        state = STATE_IN_UNKNOWN;
-                        break;
-                    }
-                }
-                if (*ptr == '"' && *(ptr - 1) != 0x5c) { // 0x5c == '\'
+                if (*ptr == '\\') {
+                    // Just skip the escape character for now as a simple implementation
+                    ptr++; 
+                    if (*ptr != '\0') temp[temp_idx++] = *ptr++;
+                } else if (*ptr == '"') {
                     temp[temp_idx] = '\0';
-                    tokens[token_count].type = JSON_STRING;
-                    strcpy(tokens[token_count].value, temp);
+                    tokens->items[token_count].type = JSON_STRING;
+                    strncpy(tokens->items[token_count].value, temp, 255);
                     token_count++;
-                    ptr++; // Skip closing quote
+                    ptr++;
                     state = STATE_START;
                 } else {
                     temp[temp_idx++] = *ptr++;
                 }
-                break;
-            }
-
-            case STATE_IN_ARRAY: {
-                
-                if (*ptr == ']') {
-                    state = STATE_START;
-                    ptr++; // Skip closing bracket
-                    tokens[token_count].type = JSON_CBRACKET;
-                    token_count++;
-                } else {
-                    state = STATE_START;
-                }
-                break;
-            }
-            case STATE_IN_OBJECT: {
-                if (*ptr == '}') {
-                    state = STATE_START;
-                    ptr++;
-                    tokens[token_count].type = JSON_CCURLY;
-                    token_count++;
-                } else {
-                    state = STATE_START;
-                }
-                break;
-            }
-            case STATE_IN_TRUE: {
-                ptr += 4; // 4 bytes of 'true'
-                token_count++;
-                state = STATE_START;
-                break;
-            }
-            case STATE_IN_FALSE: {
-                ptr += 5; // 5 bytes of 'false'
-                token_count++;
-                state = STATE_START;
-                break;
-            }
-            case STATE_IN_NULL: {
-                ptr += 4; // 4 bytes of 'null'
-                token_count++;
-                state = STATE_START;
                 break;
             }
             case STATE_IN_UNKNOWN: {
-                // We dont know what the token is, we just increment
                 ptr++;
                 state = STATE_START;
                 break;
             }
+            // Array and Object states were redundant in START state for simple tokenization
+            default:
+                state = STATE_START;
+                break;
         }
-
-        return token_count;
     }
+    return token_count;
 }
 
 int main()
@@ -283,19 +217,21 @@ int main()
     size_t buf_length = strlen(buffer);
 
 
-    Token tokens[buf_length]; // VLA: potentially dangerous ⚠️
-    // tokenizeJSON(buffer, buf_length, tokens);
+    // Correct usage of tokens pointer
+    Tokens tokens = {0};
+    tokens.items = malloc(sizeof(Token) * 1024);
+    tokens.capacity = 1024;
+    
+    int token_count = tokenizeJSON(buffer, &tokens, 1024);
 
-    // for (int i = 0; i < 100; i++) {
-    //     da_push(tokens, &i);
-    // }
-    // size_t da_len = da_size(tokens);
-    // for (size_t i = 0; i < da_len; i++) {
-    //     int elem = *(int*) da_get(tokens, i);
-    //     printf("Element nr %zu is %i\n", i, elem);
-    // }
+    for (int i = 0; i < token_count; i++) {
+        const char *type_names[] = {
+            "OCURLY", "CCURLY", "OBRACKET", "CBRACKET", "COMMA", "NUMBER", "STRING", "TRUE", "FALSE", "NULL", "UNKNOWN"
+        };
+        printf("TOKEN %d: Type %s, Value: '%s'\n", i, type_names[tokens.items[i].type], tokens.items[i].value);
+    }
 
-    // da_free(tokens);
+    free(tokens.items);
     free(buffer);
 
     // Flush stdout to ensure output is displayed
