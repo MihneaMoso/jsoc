@@ -15,6 +15,8 @@ typedef struct {
 dynarray_t *da_create(size_t elem_size, size_t capacity, void (*free_fn)(void *));
 void da_free(dynarray_t *arr);
 
+void da_reserve(dynarray_t *arr, size_t capacity);
+
 size_t da_size(const dynarray_t *arr);
 void *da_get(const dynarray_t *arr, size_t index);
 int   da_set(dynarray_t *arr, size_t index, const void *value);

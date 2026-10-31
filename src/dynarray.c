@@ -79,6 +79,14 @@ int da_resize(dynarray_t *arr, size_t new_capacity) {
 }
 
 // ------------------------------------------------------------
+// Reserve capacity
+// ------------------------------------------------------------
+void da_reserve(dynarray_t *arr, size_t capacity) {
+    if (!arr || capacity <= arr->capacity) return;
+    da_resize(arr, capacity);
+}
+
+// ------------------------------------------------------------
 // Push value (append)
 // ------------------------------------------------------------
 int da_push(dynarray_t *arr, const void *value) {

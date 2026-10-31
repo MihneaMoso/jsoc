@@ -1,3 +1,9 @@
+#include "stddef.h"
+#include "stdarg.h"
+#include "dynarray.h"
+#include "print.h"
+#include <stdio.h>
+
 #define sb_append_null(sb) da_append(sb, 0)
 
 
