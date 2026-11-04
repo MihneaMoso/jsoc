@@ -44,6 +44,12 @@
 #  define JSOC_SIMD_SSE2 0
 #endif
 
+#if defined(__PCLMUL__)
+#  define JSOC_SIMD_PCLMUL 1
+#else
+#  define JSOC_SIMD_PCLMUL 0
+#endif
+
 /* Bytes handled by the inlined scalar probe before vectors kick in. */
 #define JSOC_SCALAR_PROBE 16
 
@@ -138,6 +144,30 @@ static JSOC_NOINLINE size_t jsoc_find_string_special_long(const char *p, size_t 
 /* Inlined hot paths                                                         */
 /* ------------------------------------------------------------------------- */
 
+/* Number of consecutive ASCII digits starting at p[i], capped at len - i. */
+static inline JSOC_ALWAYS_INLINE size_t jsoc_digit_run(const char *p, size_t len, size_t i) {
+    const size_t start = i;
+#if JSOC_SIMD_AVX2 || JSOC_SIMD_SSE2
+    while (i + 16 <= len) {
+        const __m128i v = _mm_loadu_si128((const __m128i *)(const void *)(p + i));
+        const __m128i x = _mm_sub_epi8(v, _mm_set1_epi8('0'));
+        const __m128i ok = _mm_cmpeq_epi8(_mm_subs_epu8(x, _mm_set1_epi8(9)),
+                                          _mm_setzero_si128());
+        const unsigned mask = (unsigned)(uint16_t)_mm_movemask_epi8(ok);
+        if (mask != 0xFFFFu) {
+            return (i - start) + (size_t)__builtin_ctz(~mask & 0xFFFFu);
+        }
+        i += 16;
+    }
+#endif
+    while (i < len) {
+        const unsigned d = (unsigned)(unsigned char)p[i] - (unsigned)'0';
+        if (d > 9) break;
+        i++;
+    }
+    return i - start;
+}
+
 /* Index of the first byte at or after `i` that is not JSON whitespace,
  * or `len` if the remainder is all whitespace. `i` must be <= len. */
 static inline size_t jsoc_skip_ws(const char *p, size_t len, size_t i) {
@@ -167,3 +197,121 @@ static inline size_t jsoc_find_string_special(const char *p, size_t len, size_t 
     if (i >= len) return len;
     return jsoc_find_string_special_long(p, len, i);
 }
+
+/* ------------------------------------------------------------------------- */
+/* Stage 1: 64-byte structural classification                                */
+/* ------------------------------------------------------------------------- */
+
+/* State carried between 64-byte blocks by the structural scanner. */
+typedef struct {
+    uint64_t next_is_escaped;
+    uint64_t prev_in_string;
+    uint64_t prev_scalar;
+} jsoc_stage1_state;
+
+/* Per-block masks.  All are bit-per-byte, bit 0 = first byte of the block. */
+typedef struct {
+    uint64_t whitespace;
+    uint64_t op;       /* { } [ ] : , (may contain 0x0C/0x1A false positives) */
+    uint64_t quote;    /* raw '"' bytes, including escaped ones */
+    uint64_t backslash;
+    uint64_t control;  /* bytes <= 0x1F */
+} jsoc_block_masks;
+
+#if JSOC_SIMD_AVX2
+
+static inline JSOC_ALWAYS_INLINE uint64_t jsoc_mask64(uint32_t lo, uint32_t hi) {
+    return (uint64_t)lo | ((uint64_t)hi << 32);
+}
+
+/* Classify a 64-byte block.  `p` may be unaligned; it must be readable for
+ * 64 bytes (the caller copies the final short tail into a padded buffer). */
+static inline JSOC_ALWAYS_INLINE jsoc_block_masks jsoc_classify64(const uint8_t *p) {
+    const __m256i lo = _mm256_loadu_si256((const __m256i *)(const void *)p);
+    const __m256i hi = _mm256_loadu_si256((const __m256i *)(const void *)(p + 32));
+
+    /* Byte values < 0x80 map exactly through a 16-entry low-nibble table.
+     * The table stores the byte itself for whitespace, so the compare below
+     * is an exact byte match (0x30 etc. do not collide with ' '). */
+    const __m256i ws_table = _mm256_setr_epi8(
+        ' ', 100, 100, 100, 17, 100, 113, 2, 100, '\t', '\n', 112, 100, '\r', 100, 100,
+        ' ', 100, 100, 100, 17, 100, 113, 2, 100, '\t', '\n', 112, 100, '\r', 100, 100);
+
+    /* Turn '[' into '{' and ']' into '}' with | 0x20.  Their low nibbles are
+     * unique among the six operators, so one shuffle + compare finds all of
+     * them.  Bytes >= 0x80 make vpshufb produce zero, which cannot match. */
+    const __m256i op_table = _mm256_setr_epi8(
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ':', '{', ',', '}', 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ':', '{', ',', '}', 0, 0);
+
+    const __m256i lower = _mm256_set1_epi8(0x20);
+    const __m256i quote_ch = _mm256_set1_epi8('"');
+    const __m256i slash_ch = _mm256_set1_epi8('\\');
+    const __m256i ctl_ch = _mm256_set1_epi8(0x1F);
+
+    const __m256i wsl = _mm256_cmpeq_epi8(lo, _mm256_shuffle_epi8(ws_table, lo));
+    const __m256i wsh = _mm256_cmpeq_epi8(hi, _mm256_shuffle_epi8(ws_table, hi));
+
+    const __m256i curl_lo = _mm256_or_si256(lo, lower);
+    const __m256i curl_hi = _mm256_or_si256(hi, lower);
+    const __m256i opl = _mm256_cmpeq_epi8(curl_lo, _mm256_shuffle_epi8(op_table, lo));
+    const __m256i oph = _mm256_cmpeq_epi8(curl_hi, _mm256_shuffle_epi8(op_table, hi));
+
+    const __m256i ql = _mm256_cmpeq_epi8(lo, quote_ch);
+    const __m256i qh = _mm256_cmpeq_epi8(hi, quote_ch);
+    const __m256i bl = _mm256_cmpeq_epi8(lo, slash_ch);
+    const __m256i bh = _mm256_cmpeq_epi8(hi, slash_ch);
+    const __m256i cl = _mm256_cmpeq_epi8(_mm256_max_epu8(lo, ctl_ch), ctl_ch);
+    const __m256i ch = _mm256_cmpeq_epi8(_mm256_max_epu8(hi, ctl_ch), ctl_ch);
+
+    jsoc_block_masks m;
+    m.whitespace = jsoc_mask64((uint32_t)_mm256_movemask_epi8(wsl),
+                               (uint32_t)_mm256_movemask_epi8(wsh));
+    m.op         = jsoc_mask64((uint32_t)_mm256_movemask_epi8(opl),
+                               (uint32_t)_mm256_movemask_epi8(oph));
+    m.quote      = jsoc_mask64((uint32_t)_mm256_movemask_epi8(ql),
+                               (uint32_t)_mm256_movemask_epi8(qh));
+    m.backslash  = jsoc_mask64((uint32_t)_mm256_movemask_epi8(bl),
+                               (uint32_t)_mm256_movemask_epi8(bh));
+    m.control    = jsoc_mask64((uint32_t)_mm256_movemask_epi8(cl),
+                               (uint32_t)_mm256_movemask_epi8(ch));
+    return m;
+}
+
+/* Cumulative bitwise XOR: flips every bit from each set bit onward.
+ * Used to turn real-quote positions into an "inside string" mask. */
+static inline JSOC_ALWAYS_INLINE uint64_t jsoc_prefix_xor(uint64_t bits) {
+#if JSOC_SIMD_PCLMUL
+    const __m128i all_ones = _mm_set1_epi8((char)0xFF);
+    const __m128i v = _mm_set_epi64x(0, (long long)bits);
+    return (uint64_t)_mm_cvtsi128_si64(_mm_clmulepi64_si128(v, all_ones, 0));
+#else
+    bits ^= bits << 1;
+    bits ^= bits << 2;
+    bits ^= bits << 4;
+    bits ^= bits << 8;
+    bits ^= bits << 16;
+    bits ^= bits << 32;
+    return bits;
+#endif
+}
+
+/* Return the mask of characters escaped by a backslash (the character after
+ * an odd-length backslash run), carrying a trailing escape across blocks. */
+static inline JSOC_ALWAYS_INLINE uint64_t jsoc_escape_next(uint64_t backslash,
+                                                            uint64_t *next_is_escaped) {
+    const uint64_t odd_bits = 0xAAAAAAAAAAAAAAAAULL;
+    if (backslash == 0) {
+        uint64_t escaped = *next_is_escaped;
+        *next_is_escaped = 0;
+        return escaped;
+    }
+    const uint64_t potential = backslash & ~*next_is_escaped;
+    const uint64_t maybe_escaped = potential << 1;
+    const uint64_t code = ((maybe_escaped | odd_bits) - potential) ^ odd_bits;
+    const uint64_t escaped = code ^ (backslash | *next_is_escaped);
+    *next_is_escaped = (code & backslash) >> 63;
+    return escaped;
+}
+
+#endif /* JSOC_SIMD_AVX2 */

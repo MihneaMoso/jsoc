@@ -92,8 +92,10 @@ $(STATIC_LIB): $(OBJECTS)
 $(SHARED_LIB): $(OBJECTS)
 	$(CC) -shared -o $@ $^ $(LDFLAGS)
 
-$(TEST_BIN): $(TEST_SOURCES) $(STATIC_LIB) $(BUILD_DIR)/.cflags
-	$(CC) $(CFLAGS) -o $@ $(TEST_SOURCES) $(STATIC_LIB) $(LDFLAGS) $(LDLIBS)
+# The differential fuzz test includes tokenizer_internal.h to drive the SIMD
+# and portable backends directly.
+$(TEST_BIN): $(TEST_SOURCES) $(SRC_DIR)/tokenizer_internal.h $(STATIC_LIB) $(BUILD_DIR)/.cflags
+	$(CC) $(CFLAGS) -I$(SRC_DIR) -o $@ $(TEST_SOURCES) $(STATIC_LIB) $(LDFLAGS) $(LDLIBS)
 
 $(BENCH_BIN): $(BENCH_SOURCES) $(STATIC_LIB) $(BUILD_DIR)/.cflags
 	$(CC) $(CFLAGS) -o $@ $(BENCH_SOURCES) $(STATIC_LIB) $(LDFLAGS) $(LDLIBS)
