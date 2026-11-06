@@ -13,6 +13,21 @@ JSOC_INTERNAL jsoc_result jsoc_tokenize_scalar_impl(const char *input, size_t le
 JSOC_INTERNAL jsoc_result jsoc_tokenize_simd_impl(const char *input, size_t length,
                                                   jsoc_arena *arena);
 
+/* Checked variants: same token stream, plus the index of the first number that
+ * is syntactically valid but not representable (SIZE_MAX when none).  Range
+ * errors are returned out of band so callers can scope them to one document. */
+JSOC_INTERNAL jsoc_result jsoc_tokenize_checked(const char *input, size_t length,
+                                                jsoc_arena *arena,
+                                                size_t *overflow_token);
+JSOC_INTERNAL jsoc_result jsoc_tokenize_scalar_checked_impl(const char *input,
+                                                            size_t length,
+                                                            jsoc_arena *arena,
+                                                            size_t *overflow_token);
+JSOC_INTERNAL jsoc_result jsoc_tokenize_simd_checked_impl(const char *input,
+                                                          size_t length,
+                                                          jsoc_arena *arena,
+                                                          size_t *overflow_token);
+
 /* True when this build contains the AVX2 stage-1 tokenizer. */
 JSOC_INTERNAL bool jsoc_tokenizer_simd_available(void);
 

@@ -31,7 +31,10 @@ INCLUDE_DIR = include
 TEST_DIR    = test
 BENCH_DIR   = bench
 
-SOURCES = $(SRC_DIR)/arena.c $(SRC_DIR)/error.c $(SRC_DIR)/token.c $(SRC_DIR)/tokenizer.c
+SOURCES = $(SRC_DIR)/arena.c $(SRC_DIR)/error.c $(SRC_DIR)/token.c \
+          $(SRC_DIR)/tokenizer.c $(SRC_DIR)/dom.c $(SRC_DIR)/path.c \
+          $(SRC_DIR)/writer.c $(SRC_DIR)/serialize.c $(SRC_DIR)/cursor.c \
+          $(SRC_DIR)/decode.c
 OBJECTS = $(SOURCES:$(SRC_DIR)/%.c=$(BUILD_DIR)/%.o)
 DEPS    = $(OBJECTS:.o=.d)
 
@@ -41,10 +44,16 @@ SHARED_LIB = $(BUILD_DIR)/libjsoc.so
 TEST_SOURCES = $(TEST_DIR)/test_tokenizer.c
 TEST_BIN     = $(BUILD_DIR)/test_tokenizer
 
+DOM_TEST_SOURCES = $(TEST_DIR)/test_dom.c
+DOM_TEST_BIN     = $(BUILD_DIR)/test_dom
+
+CORPUS_SOURCES = $(TEST_DIR)/corpus.c
+CORPUS_BIN     = $(BUILD_DIR)/corpus
+
 BENCH_SOURCES = $(BENCH_DIR)/bench.c
 BENCH_BIN     = $(BUILD_DIR)/bench
 
-TARGETS = $(STATIC_LIB) $(SHARED_LIB) $(TEST_BIN) $(BENCH_BIN)
+TARGETS = $(STATIC_LIB) $(SHARED_LIB) $(TEST_BIN) $(DOM_TEST_BIN) $(CORPUS_BIN) $(BENCH_BIN)
 
 # Default benchmark inputs (generated under /tmp/opencode).
 BENCH_ARGS ?= /tmp/opencode/bench_compact.json /tmp/opencode/bench_pretty.json
@@ -100,17 +109,30 @@ $(TEST_BIN): $(TEST_SOURCES) $(SRC_DIR)/tokenizer_internal.h $(STATIC_LIB) $(BUI
 $(BENCH_BIN): $(BENCH_SOURCES) $(STATIC_LIB) $(BUILD_DIR)/.cflags
 	$(CC) $(CFLAGS) -o $@ $(BENCH_SOURCES) $(STATIC_LIB) $(LDFLAGS) $(LDLIBS)
 
+$(DOM_TEST_BIN): $(DOM_TEST_SOURCES) $(INCLUDE_DIR)/dom.h $(SRC_DIR)/dom_internal.h $(STATIC_LIB) $(BUILD_DIR)/.cflags
+	$(CC) $(CFLAGS) -I$(SRC_DIR) -o $@ $(DOM_TEST_SOURCES) $(STATIC_LIB) $(LDFLAGS) $(LDLIBS)
+
+$(CORPUS_BIN): $(CORPUS_SOURCES) $(SRC_DIR)/dom_internal.h $(STATIC_LIB) $(BUILD_DIR)/.cflags
+	$(CC) $(CFLAGS) -I$(SRC_DIR) -o $@ $(CORPUS_SOURCES) $(STATIC_LIB) $(LDFLAGS) $(LDLIBS)
+
 -include $(DEPS)
 
 # --- Convenience -----------------------------------------------------------
 test: release
 	./$(TEST_BIN)
+	./$(DOM_TEST_BIN)
 
 bench: release
 	./$(BENCH_BIN) $(BENCH_ARGS)
 
+# Acceptance corpora.  Fetch them first (see README) or override CORPUS_ARGS.
+CORPUS_ARGS ?= /tmp/opencode/simdjson-data/jsonchecker /tmp/opencode/JSONTestSuite/test_parsing
+corpus: release
+	./$(CORPUS_BIN) $(CORPUS_ARGS)
+
 check: asan
 	./$(TEST_BIN)
+	./$(DOM_TEST_BIN)
 
 install: release
 	install -d $(DESTDIR)/usr/local/include/jsoc
@@ -140,8 +162,10 @@ uninstall:
 clean:
 	rm -rf $(BUILD_DIR)
 
+FORMAT_SOURCES = $(SRC_DIR)/*.c $(INCLUDE_DIR)/*.h $(TEST_DIR)/*.c \
+                 $(BENCH_DIR)/*.c
 format:
-	clang-format -i $(SRC_DIR)/*.c $(INCLUDE_DIR)/*.h $(TEST_DIR)/*.c $(BENCH_DIR)/*.c 2>/dev/null || true
+	clang-format -i $(FORMAT_SOURCES) 2>/dev/null || true
 
 size: release
 	@size $(STATIC_LIB)
