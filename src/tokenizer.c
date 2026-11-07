@@ -1086,7 +1086,7 @@ static inline JSOC_ALWAYS_INLINE int grammar_step(fused_t *f, jsoc_token_type t,
  * from the stage-1 masks, so clean string bytes are never rescanned.  Any
  * invalid byte switches to the reference scanner, which reports the exact
  * error code, offset and partial token stream. */
-static inline JSOC_ALWAYS_INLINE bool
+static JSOC_NOINLINE bool
 fused_check_specials(fused_t *f, size_t base, uint64_t backslash,
                      uint64_t control, uint64_t in_string) {
   if (JSOC_UNLIKELY((control & in_string) != 0)) {
