@@ -829,24 +829,34 @@ typedef struct {
   size_t overflow_token;
 } fused_t;
 
-/* Maps a byte to the token it starts, to JSOC_KIND_SCALAR for a byte that can
- * begin a number/literal, or to 0 for a byte that cannot start a token.  This
- * also rejects the 0x0C/0x1A false positives produced by the nibble-table
- * operator mask: they map to 0 and are handled as invalid scalar starts. */
-enum { JSOC_KIND_SCALAR = 0xFF };
+/* Maps a byte to the token it starts, or to 0 for a byte that cannot start a
+ * token.  This also rejects the 0x0C/0x1A false positives produced by the
+ * nibble-table operator mask: they map to 0 and are handled as invalid scalar
+ * starts.
+ *
+ * The scalar kinds are split so that "is this a literal" is a single test
+ * instead of three byte comparisons on the number-heavy path: a number start
+ * is JSOC_KIND_NUMBER, and the three literals take the next three values in
+ * literal order (true, false, null), so the table also names the literal. */
+enum {
+  JSOC_KIND_NUMBER = JSOC_TOK_NULL + 1, /* '-' or a digit */
+  JSOC_KIND_TRUE = JSOC_KIND_NUMBER + 1,
+  JSOC_KIND_FALSE,
+  JSOC_KIND_NULL_KIND,
+};
 
 static const unsigned char jsoc_token_kind[256] = {
     ['{'] = JSOC_TOK_OBJ_BEGIN, ['}'] = JSOC_TOK_OBJ_END,
     ['['] = JSOC_TOK_ARR_BEGIN, [']'] = JSOC_TOK_ARR_END,
     [','] = JSOC_TOK_COMMA,     [':'] = JSOC_TOK_COLON,
-    ['"'] = JSOC_TOK_STRING,    ['t'] = JSOC_KIND_SCALAR,
-    ['f'] = JSOC_KIND_SCALAR,   ['n'] = JSOC_KIND_SCALAR,
-    ['-'] = JSOC_KIND_SCALAR,   ['0'] = JSOC_KIND_SCALAR,
-    ['1'] = JSOC_KIND_SCALAR,   ['2'] = JSOC_KIND_SCALAR,
-    ['3'] = JSOC_KIND_SCALAR,   ['4'] = JSOC_KIND_SCALAR,
-    ['5'] = JSOC_KIND_SCALAR,   ['6'] = JSOC_KIND_SCALAR,
-    ['7'] = JSOC_KIND_SCALAR,   ['8'] = JSOC_KIND_SCALAR,
-    ['9'] = JSOC_KIND_SCALAR,
+    ['"'] = JSOC_TOK_STRING,    ['t'] = JSOC_KIND_TRUE,
+    ['f'] = JSOC_KIND_FALSE,    ['n'] = JSOC_KIND_NULL_KIND,
+    ['-'] = JSOC_KIND_NUMBER,   ['0'] = JSOC_KIND_NUMBER,
+    ['1'] = JSOC_KIND_NUMBER,   ['2'] = JSOC_KIND_NUMBER,
+    ['3'] = JSOC_KIND_NUMBER,   ['4'] = JSOC_KIND_NUMBER,
+    ['5'] = JSOC_KIND_NUMBER,   ['6'] = JSOC_KIND_NUMBER,
+    ['7'] = JSOC_KIND_NUMBER,   ['8'] = JSOC_KIND_NUMBER,
+    ['9'] = JSOC_KIND_NUMBER,
 };
 
 /* Failure is recorded inline: the hot loop must not contain calls, otherwise
@@ -1313,16 +1323,18 @@ again:
     return true;
   }
 
-  if (k == JSOC_KIND_SCALAR) {
+  if (k >= JSOC_KIND_NUMBER) {
     g = grammar_step(f, JSOC_TOK_NUMBER, s);
     if (g == 2)
       goto again;
     if (g != 0)
       return false;
 
-    if (c == 't' || c == 'f' || c == 'n') {
-      const size_t litlen = (c == 'f') ? 5 : 4;
-      const char *lit = (c == 't') ? "true" : ((c == 'f') ? "false" : "null");
+    if (k != JSOC_KIND_NUMBER) {
+      const size_t litlen = (k == JSOC_KIND_FALSE) ? 5 : 4;
+      const char *lit = (k == JSOC_KIND_TRUE)
+                            ? "true"
+                            : ((k == JSOC_KIND_FALSE) ? "false" : "null");
       /* Compare inline: a memcmp() call per literal costs more than the
        * four/five byte loads and would force spills around it. */
       bool ok = s + litlen <= f->length;
