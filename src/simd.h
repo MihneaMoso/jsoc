@@ -216,6 +216,7 @@ typedef struct {
     uint64_t quote;    /* raw '"' bytes, including escaped ones */
     uint64_t backslash;
     uint64_t control;  /* bytes <= 0x1F */
+    uint64_t nonascii; /* non-zero when any byte has the high bit set */
 } jsoc_block_masks;
 
 #if JSOC_SIMD_AVX2
@@ -275,6 +276,8 @@ static inline JSOC_ALWAYS_INLINE jsoc_block_masks jsoc_classify64(const uint8_t 
                                (uint32_t)_mm256_movemask_epi8(bh));
     m.control    = jsoc_mask64((uint32_t)_mm256_movemask_epi8(cl),
                                (uint32_t)_mm256_movemask_epi8(ch));
+    m.nonascii   = (uint64_t)(_mm256_movemask_epi8(
+                                    _mm256_or_si256(lo, hi)) != 0);
     return m;
 }
 

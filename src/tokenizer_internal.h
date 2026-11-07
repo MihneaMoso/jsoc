@@ -71,6 +71,15 @@ JSOC_INTERNAL jsoc_result jsoc_tokenize_compact_checked(const char *input,
                                                         jsoc_arena *arena,
                                                         size_t *overflow_token);
 
+/* DOM fast path: same compact token stream and errors as
+ * `jsoc_tokenize_compact_checked`, but UTF-8 is validated inside the stage-1
+ * scan (AVX2, length >= 64); other inputs take the ordinary UTF-8 check plus
+ * the portable compact tokenizer. */
+JSOC_INTERNAL jsoc_result jsoc_tokenize_compact_utf8(const char *input,
+                                                     size_t length,
+                                                     jsoc_arena *arena,
+                                                     size_t *overflow_token);
+
 /* True when this build contains the AVX2 stage-1 tokenizer. */
 JSOC_INTERNAL bool jsoc_tokenizer_simd_available(void);
 

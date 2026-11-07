@@ -415,7 +415,10 @@ static size_t dom_skip_value(const jsoc_token *tokens, size_t start,
     }
     i++;
   } while (i < limit && depth != 0);
-  return i;
+  /* Unbalanced at the end of the window: the document is truncated, not
+   * complete.  Returning `limit` here would let the caller mistake the last
+   * token for a closer. */
+  return depth == 0 ? i : SIZE_MAX;
 }
 
 /* True when the value at `start` is complete inside [start, limit): a scalar
@@ -432,7 +435,7 @@ static bool dom_value_complete(const jsoc_token *tokens, size_t start,
     return true;
   }
   const size_t end = dom_skip_value(tokens, start, limit);
-  if (end > limit)
+  if (end == SIZE_MAX || end > limit)
     return false;
   /* A container ends with its closing token only when the depth closed
    * exactly, i.e. the token before `end` is a closer. */
@@ -467,18 +470,12 @@ JSOC_API jsoc_document jsoc_parse(const char *input, size_t length,
     return doc;
   }
 
-  size_t utf8_offset = 0;
-  if (JSOC_UNLIKELY(!jsoc_utf8_valid(input, length, &utf8_offset))) {
-    doc.error =
-        jsoc_error_at_offset(input, length, JSOC_ERR_INVALID_UTF8, utf8_offset);
-    return doc;
-  }
-
   size_t overflow_token = SIZE_MAX;
   /* Compact mode: separators are validated by the tokenizer but not stored,
-   * so the container loops below need no comma/colon bookkeeping. */
+   * so the container loops below need no comma/colon bookkeeping.  UTF-8 is
+   * validated inside the same stage-1 pass. */
   jsoc_result r =
-      jsoc_tokenize_compact_checked(input, length, arena, &overflow_token);
+      jsoc_tokenize_compact_utf8(input, length, arena, &overflow_token);
   if (JSOC_UNLIKELY(r.error.code != JSOC_OK)) {
     doc.error = r.error;
     return doc;

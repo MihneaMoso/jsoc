@@ -7,6 +7,7 @@
 #include "simd.h"
 #include "token.h"
 #include "tokenizer_internal.h"
+#include "utf8.h"
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -822,6 +823,9 @@ typedef struct {
   bool stream;
   /* Compact mode: ',' and ':' are validated but not stored (DOM only). */
   bool compact;
+  /* Validate UTF-8 in the same pass as the tokenizer (DOM fast path). */
+  bool check_utf8;
+  jsoc_utf8_state utf8;
   size_t overflow_token;
 } fused_t;
 
@@ -1436,6 +1440,29 @@ static inline void fused_process_block(fused_t *f, const uint8_t *block,
                                        size_t base, uint64_t valid_mask) {
   const jsoc_block_masks m = jsoc_classify64(block);
 
+  if (JSOC_UNLIKELY(f->check_utf8) &&
+      JSOC_LIKELY((m.quote | f->s1.prev_in_string) != 0)) {
+    /* On the success path every non-ASCII byte is inside a string, so blocks
+     * with no string activity need no UTF-8 work.  Invalid UTF-8 elsewhere
+     * makes the tokenizer fail, and that path re-validates the whole input. */
+    if (JSOC_LIKELY(m.nonascii == 0)) {
+      /* Both 32-byte chunks are ASCII.  This terminates any pending
+       * multibyte sequence (which is an error) and resets the carry state.
+       * Zero is a valid stand-in for the previous ASCII bytes in the next
+       * block's checks. */
+      f->utf8.error = _mm256_or_si256(f->utf8.error, f->utf8.prev_incomplete);
+      f->utf8.prev_incomplete = _mm256_setzero_si256();
+      f->utf8.prev_input = _mm256_setzero_si256();
+    } else {
+      jsoc_utf8_check_chunk(
+          &f->utf8,
+          _mm256_loadu_si256((const __m256i *)(const void *)block));
+      jsoc_utf8_check_chunk(
+          &f->utf8,
+          _mm256_loadu_si256((const __m256i *)(const void *)(block + 32)));
+    }
+  }
+
   uint64_t quote;
   uint64_t in_string;
   if (JSOC_LIKELY(m.quote == 0 && f->s1.prev_in_string == 0)) {
@@ -1495,7 +1522,7 @@ static inline void fused_process_block(fused_t *f, const uint8_t *block,
 static inline JSOC_ALWAYS_INLINE jsoc_result
 tokenize_simd_core(const char *input, size_t length, jsoc_arena *arena,
                    size_t *overflow_token, bool check_numbers, bool stream,
-                   bool compact) {
+                   bool compact, bool check_utf8) {
   jsoc_result result = {
       .error = {JSOC_OK, 0, 0, 0}, .tokens = NULL, .count = 0};
 
@@ -1511,6 +1538,7 @@ tokenize_simd_core(const char *input, size_t length, jsoc_arena *arena,
   f.check_numbers = check_numbers;
   f.stream = stream;
   f.compact = compact;
+  f.check_utf8 = check_utf8;
   f.overflow_token = SIZE_MAX;
 
   /* Same density heuristic as the portable path; geometric growth handles
@@ -1546,15 +1574,46 @@ tokenize_simd_core(const char *input, size_t length, jsoc_arena *arena,
      * first error in input order. */
   }
 
-  if (JSOC_UNLIKELY(f.need_scalar)) {
-    /* Invalid escape/control byte: the reference scanner reports the
-     * exact error and the same partial token stream. */
-    return tokenize_scalar(input, length, arena, overflow_token, stream,
-                            compact);
+  if (JSOC_UNLIKELY(f.need_scalar || f.failed)) {
+    /* The fused scan may have stopped early, so consult the full validator
+     * to preserve the existing precedence: UTF-8 errors are reported before
+     * syntax errors anywhere in the input. */
+    if (check_utf8) {
+      size_t off = 0;
+      if (!jsoc_utf8_valid(input, length, &off)) {
+        result.error =
+            jsoc_error_at_offset(input, length, JSOC_ERR_INVALID_UTF8, off);
+        result.tokens = f.tokens;
+        result.count = f.count;
+        if (overflow_token)
+          *overflow_token = f.overflow_token;
+        return result;
+      }
+    }
+    if (f.need_scalar) {
+      /* Invalid escape/control byte: the reference scanner reports the
+       * exact error and the same partial token stream. */
+      return tokenize_scalar(input, length, arena, overflow_token, stream,
+                             compact);
+    }
+    goto fail;
   }
 
-  if (JSOC_UNLIKELY(f.failed))
-    goto fail;
+  if (check_utf8) {
+    f.utf8.error = _mm256_or_si256(f.utf8.error, f.utf8.prev_incomplete);
+    if (JSOC_UNLIKELY(!_mm256_testz_si256(f.utf8.error, f.utf8.error))) {
+      /* Cold: find the exact offending byte with the scalar oracle. */
+      size_t off = 0;
+      (void)jsoc_utf8_validate_scalar((const uint8_t *)input, length, &off);
+      result.error =
+          jsoc_error_at_offset(input, length, JSOC_ERR_INVALID_UTF8, off);
+      result.tokens = f.tokens;
+      result.count = f.count;
+      if (overflow_token)
+        *overflow_token = f.overflow_token;
+      return result;
+    }
+  }
 
   if (f.pending == JSOC_PEND_STRING) {
     fused_fail(&f, JSOC_ERR_UNTERMINATED_STRING, length);
@@ -1600,21 +1659,22 @@ fail:
 JSOC_INTERNAL jsoc_result jsoc_tokenize_simd_impl(const char *input,
                                                   size_t length,
                                                   jsoc_arena *arena) {
-  return tokenize_simd_core(input, length, arena, NULL, false, false, false);
+  return tokenize_simd_core(input, length, arena, NULL, false, false, false,
+                            false);
 }
 
 JSOC_INTERNAL jsoc_result
 jsoc_tokenize_simd_stream_impl(const char *input, size_t length,
                                jsoc_arena *arena, size_t *overflow_token) {
   return tokenize_simd_core(input, length, arena, overflow_token,
-                            overflow_token != NULL, true, false);
+                            overflow_token != NULL, true, false, false);
 }
 
 JSOC_INTERNAL jsoc_result
 jsoc_tokenize_simd_checked_impl(const char *input, size_t length,
                                 jsoc_arena *arena, size_t *overflow_token) {
   return tokenize_simd_core(input, length, arena, overflow_token, true, false,
-                            false);
+                            false, false);
 }
 
 JSOC_INTERNAL jsoc_result jsoc_tokenize_simd_compact_impl(const char *input,
@@ -1622,7 +1682,7 @@ JSOC_INTERNAL jsoc_result jsoc_tokenize_simd_compact_impl(const char *input,
                                                           jsoc_arena *arena,
                                                           size_t *overflow_token) {
   return tokenize_simd_core(input, length, arena, overflow_token, true, false,
-                            true);
+                            true, false);
 }
 
 JSOC_INTERNAL jsoc_result
@@ -1630,7 +1690,7 @@ jsoc_tokenize_simd_stream_compact_impl(const char *input, size_t length,
                                        jsoc_arena *arena,
                                        size_t *overflow_token) {
   return tokenize_simd_core(input, length, arena, overflow_token,
-                            overflow_token != NULL, true, true);
+                            overflow_token != NULL, true, true, false);
 }
 
 #endif /* JSOC_SIMD_AVX2 */
@@ -1811,6 +1871,48 @@ JSOC_INTERNAL jsoc_result jsoc_tokenize_compact_checked(const char *input,
   }
 #endif
   return jsoc_tokenize_scalar_compact_impl(input, length, arena, overflow_token);
+}
+
+/* DOM fast path: compact checked tokenizer that also validates UTF-8 inside
+ * the same stage-1 pass.  On inputs the SIMD path does not handle, this falls
+ * back to the ordinary UTF-8 check plus the portable compact tokenizer, so the
+ * public entry points and their token layout are unchanged. */
+JSOC_INTERNAL jsoc_result jsoc_tokenize_compact_utf8(const char *input,
+                                                     size_t length,
+                                                     jsoc_arena *arena,
+                                                     size_t *overflow_token) {
+  if (overflow_token)
+    *overflow_token = SIZE_MAX;
+  if (JSOC_UNLIKELY(!input || length == 0)) {
+    return (jsoc_result){
+        .error = {JSOC_ERR_SYNTAX, 0, 1, 1}, .tokens = NULL, .count = 0};
+  }
+  if (JSOC_UNLIKELY(!arena)) {
+    return (jsoc_result){
+        .error = {JSOC_ERR_NOMEM, 0, 1, 1}, .tokens = NULL, .count = 0};
+  }
+  if (JSOC_UNLIKELY(!tokens_fit_u32(length))) {
+    return (jsoc_result){.error = {JSOC_ERR_INPUT_TOO_LARGE, 0, 1, 1},
+                         .tokens = NULL,
+                         .count = 0};
+  }
+
+#if JSOC_SIMD_AVX2
+  if (length >= 64) {
+    return tokenize_simd_core(input, length, arena, overflow_token, true, false,
+                              true, true);
+  }
+#endif
+
+  size_t utf8_offset = 0;
+  if (JSOC_UNLIKELY(!jsoc_utf8_valid(input, length, &utf8_offset))) {
+    return (jsoc_result){.error = jsoc_error_at_offset(
+                                       input, length, JSOC_ERR_INVALID_UTF8,
+                                       utf8_offset),
+                         .tokens = NULL,
+                         .count = 0};
+  }
+  return jsoc_tokenize_compact_checked(input, length, arena, overflow_token);
 }
 
 /* Internal entry point used by the DOM: identical token stream, plus the token

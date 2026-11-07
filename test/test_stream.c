@@ -278,6 +278,74 @@ fail:
   return false;
 }
 
+static bool test_truncated_document_not_delivered(void) {
+  /* Regression: an unclosed trailing document must never be handed to the
+   * builder.  The stream scanner used to treat the last token of a truncated
+   * window as a matching closer whenever its type matched the root type, even
+   * with containers still open, which made the DOM builder read past the token
+   * array (heap-buffer-overflow found by the NDJSON fuzzer under ASan). */
+  jsoc_arena *a = jsoc_arena_create(1 << 16);
+  REQUIRE(a != NULL);
+  {
+    /* Root object, inner array still open, last emitted token is '}'. */
+    const char *text = "{\"a\":[{\"b\":1}";
+    stream_stats stats;
+    jsoc_error err = run_stream(text, strlen(text), a, &stats);
+    REQUIRE(err.code == JSOC_ERR_UNTERMINATED_ARRAY);
+    REQUIRE(stats.count == 0);
+  }
+  jsoc_arena_reset(a);
+  {
+    /* Root array, outer array still open, last emitted token is ']'. */
+    const char *text = "[[{}]";
+    stream_stats stats;
+    jsoc_error err = run_stream(text, strlen(text), a, &stats);
+    REQUIRE(err.code == JSOC_ERR_UNTERMINATED_ARRAY);
+    REQUIRE(stats.count == 0);
+  }
+  jsoc_arena_reset(a);
+  {
+    /* Truncated inside a string with several open containers. */
+    const char *text = "{\"a\":[1,2,{\"b\":\"unterminated";
+    stream_stats stats;
+    jsoc_error err = run_stream(text, strlen(text), a, &stats);
+    REQUIRE(err.code == JSOC_ERR_UNTERMINATED_STRING);
+    REQUIRE(stats.count == 0);
+  }
+  jsoc_arena_reset(a);
+  {
+    /* Unclosed array, no string involvement. */
+    const char *text = "1 {\"a\":[1,2";
+    stream_stats stats;
+    jsoc_error err = run_stream(text, strlen(text), a, &stats);
+    REQUIRE(err.code == JSOC_ERR_UNTERMINATED_ARRAY);
+    REQUIRE(stats.count == 1); /* the leading "1" is complete */
+  }
+  jsoc_arena_reset(a);
+  {
+    /* Containers opened but nothing else: no complete document exists. */
+    const char *text = "[[[";
+    stream_stats stats;
+    jsoc_error err = run_stream(text, strlen(text), a, &stats);
+    REQUIRE(err.code == JSOC_ERR_UNTERMINATED_ARRAY);
+    REQUIRE(stats.count == 0);
+  }
+  jsoc_arena_reset(a);
+  {
+    /* Truncated object after a complete document. */
+    const char *text = "{\"a\":1} {\"b\":2";
+    stream_stats stats;
+    jsoc_error err = run_stream(text, strlen(text), a, &stats);
+    REQUIRE(err.code == JSOC_ERR_UNTERMINATED_OBJECT);
+    REQUIRE(stats.count == 1);
+  }
+  jsoc_arena_destroy(a);
+  return true;
+fail:
+  jsoc_arena_destroy(a);
+  return false;
+}
+
 int main(void) {
   printf("=== jsoc streaming tests ===\n\n");
 
@@ -289,6 +357,7 @@ int main(void) {
   TEST(6, bom_and_unicode_separators);
   TEST(7, adversarial_single_documents);
   TEST(8, does_not_read_past_stream);
+  TEST(9, truncated_document_not_delivered);
 
   return jsoc_test_finish("stream");
 }
