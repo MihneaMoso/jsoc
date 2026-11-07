@@ -8,6 +8,10 @@
 extern "C" {
 #endif
 
+/* Maximum nesting depth accepted by the tokenizer (arrays plus objects).
+ * Public because callers size frames from it. */
+#define JSOC_MAX_DEPTH 1024
+
 typedef enum jsoc_token_type : uint8_t {
   JSOC_TOK_EOF = 0,
   JSOC_TOK_OBJ_BEGIN,

@@ -18,7 +18,6 @@
 /* Hard limit on container nesting.  The parser is iterative, so this only
  * bounds the bracket stack; it exists to turn pathological input into a
  * clean error instead of unbounded memory use downstream. */
-#define JSOC_MAX_DEPTH 1024
 
 typedef struct {
   const char *input;
@@ -38,6 +37,22 @@ typedef struct {
    * syntactically valid but unrepresentable.  The DOM decides later whether
    * that number belongs to the document it exposes. */
   bool check_numbers;
+
+  /* Offset just past the most recent number/literal token (SIZE_MAX when the
+   * last value was a string or a container).  A byte glued to a scalar can
+   * never start a new document, in any mode. */
+  size_t last_scalar_end;
+
+  /* Stream mode: a second top-level value is accepted without whitespace
+   * after the first one (ndjson streams).  `jsoc_parse` uses the strict
+   * form, `jsoc_parse_many` the relaxed one. */
+  bool stream;
+
+  /* Compact mode: ',' and ':' are validated but not stored.  The DOM never
+   * needs a separator - the container it belongs to implies it - and they are
+   * 37-46% of the tokens in the corpora that matter.  Only the DOM path uses
+   * this; the public token stream is unchanged. */
+  bool compact;
   size_t overflow_token;
 } tokenizer_t;
 
@@ -108,6 +123,12 @@ static JSOC_NOINLINE jsoc_error tokens_grow(tokenizer_t *t) {
 
 static inline jsoc_error push_token(tokenizer_t *t, jsoc_token_type type,
                                     size_t offset, size_t length) {
+  /* Compact mode: the separator is still validated by the grammar, it just is
+   * not part of the stream the DOM consumes. */
+  if (JSOC_UNLIKELY(t->compact &&
+                    (type == JSOC_TOK_COMMA || type == JSOC_TOK_COLON))) {
+    return JSOC_ERR_NONE;
+  }
   if (JSOC_UNLIKELY(t->count == t->capacity)) {
     jsoc_error err = tokens_grow(t);
     if (JSOC_UNLIKELY(err.code != JSOC_OK))
@@ -236,6 +257,7 @@ static jsoc_error parse_number(tokenizer_t *t) {
   }
 
   t->pos = end;
+  t->last_scalar_end = end;
   return push_token(t, JSOC_TOK_NUMBER, start, end - start);
 }
 
@@ -250,6 +272,7 @@ static jsoc_error parse_literal(tokenizer_t *t, const char *lit, size_t len,
   jsoc_error err = push_token(t, type, t->pos, len);
   if (JSOC_UNLIKELY(err.code != JSOC_OK))
     return err;
+  t->last_scalar_end = t->pos + len;
   t->pos += len;
   return JSOC_ERR_NONE;
 }
@@ -259,7 +282,8 @@ static jsoc_error parse_literal(tokenizer_t *t, const char *lit, size_t len,
 /* ------------------------------------------------------------------------- */
 
 static jsoc_result tokenize_scalar(const char *input, size_t length,
-                                   jsoc_arena *arena, size_t *overflow_token) {
+                                   jsoc_arena *arena, size_t *overflow_token,
+                                   bool stream, bool compact) {
   jsoc_result result = {
       .error = {JSOC_OK, 0, 0, 0}, .tokens = NULL, .count = 0};
 
@@ -274,6 +298,9 @@ static jsoc_result tokenize_scalar(const char *input, size_t length,
       .depth = 0,
       .after_comma = false,
       .check_numbers = overflow_token != NULL,
+      .last_scalar_end = SIZE_MAX,
+      .stream = stream,
+      .compact = compact,
       .overflow_token = SIZE_MAX,
   };
   if (overflow_token)
@@ -450,11 +477,16 @@ sv_after:
     goto at_eof;
 
   if (JSOC_UNLIKELY(t.depth == 0)) {
-    /* A second top-level value is only accepted when separated by
-     * whitespace (ndjson-style streams), never back-to-back. */
+    /* A second top-level value is accepted when separated by whitespace
+     * (ndjson-style), or in stream mode without whitespace too - but never
+     * glued to the previous scalar: `1"x"` and `true1` are junk, matching
+     * the fused backend, where `follows` suppresses such a start. */
     bool separated = t.pos > 0 && jsoc_is_ws((unsigned char)t.input[t.pos - 1]);
-    if (separated && starts_value((unsigned char)t.input[t.pos]))
+    bool glued = t.pos == t.last_scalar_end;
+    if ((separated || t.stream) && !glued &&
+        starts_value((unsigned char)t.input[t.pos])) {
       goto sv_value;
+    }
     err = make_error(&t, JSOC_ERR_TRAILING_GARBAGE);
     goto fail;
   }
@@ -530,13 +562,33 @@ fail:
 JSOC_INTERNAL jsoc_result jsoc_tokenize_scalar_impl(const char *input,
                                                     size_t length,
                                                     jsoc_arena *arena) {
-  return tokenize_scalar(input, length, arena, NULL);
+  return tokenize_scalar(input, length, arena, NULL, false, false);
+}
+
+JSOC_INTERNAL jsoc_result
+jsoc_tokenize_scalar_stream_impl(const char *input, size_t length,
+                                 jsoc_arena *arena, size_t *overflow_token) {
+  return tokenize_scalar(input, length, arena, overflow_token, true, false);
 }
 
 JSOC_INTERNAL jsoc_result
 jsoc_tokenize_scalar_checked_impl(const char *input, size_t length,
                                   jsoc_arena *arena, size_t *overflow_token) {
-  return tokenize_scalar(input, length, arena, overflow_token);
+  return tokenize_scalar(input, length, arena, overflow_token, false, false);
+}
+
+JSOC_INTERNAL jsoc_result jsoc_tokenize_scalar_compact_impl(const char *input,
+                                                            size_t length,
+                                                            jsoc_arena *arena,
+                                                            size_t *overflow_token) {
+  return tokenize_scalar(input, length, arena, overflow_token, false, true);
+}
+
+JSOC_INTERNAL jsoc_result
+jsoc_tokenize_scalar_stream_compact_impl(const char *input, size_t length,
+                                         jsoc_arena *arena,
+                                         size_t *overflow_token) {
+  return tokenize_scalar(input, length, arena, overflow_token, true, true);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -766,6 +818,10 @@ typedef struct {
 
   /* Checked mode, mirroring tokenizer_t. */
   bool check_numbers;
+  /* Stream mode: adjacent top-level documents are accepted. */
+  bool stream;
+  /* Compact mode: ',' and ':' are validated but not stored (DOM only). */
+  bool compact;
   size_t overflow_token;
 } fused_t;
 
@@ -836,6 +892,16 @@ fused_emit(fused_t *f, jsoc_token_type type, size_t offset, size_t length) {
       jsoc_token_make(type, (uint32_t)offset, (uint32_t)length);
 }
 
+/* Compact mode: separators are validated by the grammar but never stored,
+ * because the container they belong to implies them.  Keeping this check at
+ * the three separator sites (instead of in fused_emit) leaves the much more
+ * frequent value emits branch-free. */
+static inline JSOC_ALWAYS_INLINE void
+fused_emit_separator(fused_t *f, jsoc_token_type type, size_t offset) {
+  if (!f->compact)
+    fused_emit(f, type, offset, 1);
+}
+
 /* Handling for the state that follows a complete value.  This is the most
  * frequent structural transition, so it is kept separate and branch-light. */
 static inline JSOC_ALWAYS_INLINE int
@@ -863,11 +929,12 @@ grammar_after(fused_t *f, jsoc_token_type t, size_t s) {
     return 0;
   }
 
-  /* A value, ':' or opening bracket after a value: only legal at the top
-   * level when whitespace separated (ndjson-style streams). */
+  /* A value, ':' or opening bracket after a value: legal at the top level
+   * only when whitespace separated (ndjson-style streams), unless the caller
+   * is reading a stream, where adjacent documents are legal. */
   if (f->depth == 0) {
-    if (t != JSOC_TOK_COLON && s > 0 &&
-        jsoc_is_ws((unsigned char)f->input[s - 1])) {
+    const bool separated = s > 0 && jsoc_is_ws((unsigned char)f->input[s - 1]);
+    if (t != JSOC_TOK_COLON && (separated || f->stream)) {
       f->state = JSOC_GS_DOC;
       return 2;
     }
@@ -1092,7 +1159,7 @@ fused_try_comma(fused_t *f, uint64_t *rest_starts, size_t base) {
   *rest_starts &= *rest_starts - 1;
   if (JSOC_UNLIKELY(grammar_after(f, JSOC_TOK_COMMA, base + b) != 0))
     return -1;
-  fused_emit(f, JSOC_TOK_COMMA, base + b, 1);
+  fused_emit_separator(f, JSOC_TOK_COMMA, base + b);
   return 1;
 }
 
@@ -1107,7 +1174,7 @@ fused_try_colon(fused_t *f, uint64_t *rest_starts, size_t base) {
     return false;
   *rest_starts &= *rest_starts - 1;
   f->state = JSOC_GS_VAL;
-  fused_emit(f, JSOC_TOK_COLON, base + b, 1);
+  fused_emit_separator(f, JSOC_TOK_COLON, base + b);
   return true;
 }
 
@@ -1155,7 +1222,7 @@ static inline JSOC_ALWAYS_INLINE int fused_scalar_done(fused_t *f, size_t end,
     if (f->input[base + b] == ',') {
       if (JSOC_UNLIKELY(grammar_after(f, JSOC_TOK_COMMA, base + b) != 0))
         return FUSED_FAILED;
-      fused_emit(f, JSOC_TOK_COMMA, base + b, 1);
+      fused_emit_separator(f, JSOC_TOK_COMMA, base + b);
       if (!fused_take_start(rest_starts, base, s))
         return FUSED_DONE;
     } else {
@@ -1315,7 +1382,11 @@ again:
       goto again;
     if (g != 0)
       return false;
-    fused_emit(f, (jsoc_token_type)k, s, 1);
+    if (f->compact && (k == JSOC_TOK_COMMA || k == JSOC_TOK_COLON)) {
+      /* Validated, deliberately not stored (see fused_emit_separator). */
+    } else {
+      fused_emit(f, (jsoc_token_type)k, s, 1);
+    }
     if (f->state == JSOC_GS_AFTER) {
       const int r = fused_try_comma(f, rest_starts, base);
       if (JSOC_UNLIKELY(r < 0))
@@ -1423,7 +1494,8 @@ static inline void fused_process_block(fused_t *f, const uint8_t *block,
 
 static inline JSOC_ALWAYS_INLINE jsoc_result
 tokenize_simd_core(const char *input, size_t length, jsoc_arena *arena,
-                   size_t *overflow_token, bool check_numbers) {
+                   size_t *overflow_token, bool check_numbers, bool stream,
+                   bool compact) {
   jsoc_result result = {
       .error = {JSOC_OK, 0, 0, 0}, .tokens = NULL, .count = 0};
 
@@ -1437,6 +1509,8 @@ tokenize_simd_core(const char *input, size_t length, jsoc_arena *arena,
   f.arena = arena;
   f.state = JSOC_GS_DOC;
   f.check_numbers = check_numbers;
+  f.stream = stream;
+  f.compact = compact;
   f.overflow_token = SIZE_MAX;
 
   /* Same density heuristic as the portable path; geometric growth handles
@@ -1475,7 +1549,8 @@ tokenize_simd_core(const char *input, size_t length, jsoc_arena *arena,
   if (JSOC_UNLIKELY(f.need_scalar)) {
     /* Invalid escape/control byte: the reference scanner reports the
      * exact error and the same partial token stream. */
-    return tokenize_scalar(input, length, arena, overflow_token);
+    return tokenize_scalar(input, length, arena, overflow_token, stream,
+                            compact);
   }
 
   if (JSOC_UNLIKELY(f.failed))
@@ -1525,28 +1600,74 @@ fail:
 JSOC_INTERNAL jsoc_result jsoc_tokenize_simd_impl(const char *input,
                                                   size_t length,
                                                   jsoc_arena *arena) {
-  return tokenize_simd_core(input, length, arena, NULL, false);
+  return tokenize_simd_core(input, length, arena, NULL, false, false, false);
+}
+
+JSOC_INTERNAL jsoc_result
+jsoc_tokenize_simd_stream_impl(const char *input, size_t length,
+                               jsoc_arena *arena, size_t *overflow_token) {
+  return tokenize_simd_core(input, length, arena, overflow_token,
+                            overflow_token != NULL, true, false);
 }
 
 JSOC_INTERNAL jsoc_result
 jsoc_tokenize_simd_checked_impl(const char *input, size_t length,
                                 jsoc_arena *arena, size_t *overflow_token) {
-  return tokenize_simd_core(input, length, arena, overflow_token, true);
+  return tokenize_simd_core(input, length, arena, overflow_token, true, false,
+                            false);
+}
+
+JSOC_INTERNAL jsoc_result jsoc_tokenize_simd_compact_impl(const char *input,
+                                                          size_t length,
+                                                          jsoc_arena *arena,
+                                                          size_t *overflow_token) {
+  return tokenize_simd_core(input, length, arena, overflow_token, true, false,
+                            true);
+}
+
+JSOC_INTERNAL jsoc_result
+jsoc_tokenize_simd_stream_compact_impl(const char *input, size_t length,
+                                       jsoc_arena *arena,
+                                       size_t *overflow_token) {
+  return tokenize_simd_core(input, length, arena, overflow_token,
+                            overflow_token != NULL, true, true);
 }
 
 #endif /* JSOC_SIMD_AVX2 */
 
 #if !JSOC_SIMD_AVX2
+/* No SIMD in this build: every backend entry point is the portable scanner.
+ * The SIMD-named ones exist so callers do not need #ifdef. */
 JSOC_INTERNAL jsoc_result jsoc_tokenize_simd_impl(const char *input,
                                                   size_t length,
                                                   jsoc_arena *arena) {
-  return tokenize_scalar(input, length, arena, NULL);
+  return tokenize_scalar(input, length, arena, NULL, false, false);
+}
+
+JSOC_INTERNAL jsoc_result
+jsoc_tokenize_simd_stream_impl(const char *input, size_t length,
+                               jsoc_arena *arena, size_t *overflow_token) {
+  return tokenize_scalar(input, length, arena, overflow_token, true, false);
 }
 
 JSOC_INTERNAL jsoc_result
 jsoc_tokenize_simd_checked_impl(const char *input, size_t length,
                                 jsoc_arena *arena, size_t *overflow_token) {
-  return tokenize_scalar(input, length, arena, overflow_token);
+  return tokenize_scalar(input, length, arena, overflow_token, false, false);
+}
+
+JSOC_INTERNAL jsoc_result jsoc_tokenize_simd_compact_impl(const char *input,
+                                                          size_t length,
+                                                          jsoc_arena *arena,
+                                                          size_t *overflow_token) {
+  return tokenize_scalar(input, length, arena, overflow_token, false, true);
+}
+
+JSOC_INTERNAL jsoc_result
+jsoc_tokenize_simd_stream_compact_impl(const char *input, size_t length,
+                                       jsoc_arena *arena,
+                                       size_t *overflow_token) {
+  return tokenize_scalar(input, length, arena, overflow_token, true, true);
 }
 #endif
 
@@ -1594,6 +1715,102 @@ static jsoc_result tokenize_dispatch(const char *input, size_t length,
 JSOC_API jsoc_result jsoc_tokenize(const char *input, size_t length,
                                    jsoc_arena *arena) {
   return tokenize_dispatch(input, length, arena, NULL);
+}
+
+/* Stream variant of the internal dispatcher: identical token stream to
+ * `jsoc_tokenize_checked`, except that adjacent top-level documents are
+ * accepted (ndjson). */
+JSOC_INTERNAL jsoc_result jsoc_tokenize_stream_checked(const char *input,
+                                                       size_t length,
+                                                       jsoc_arena *arena,
+                                                       size_t *overflow_token) {
+  if (overflow_token)
+    *overflow_token = SIZE_MAX;
+  if (JSOC_UNLIKELY(!input || length == 0)) {
+    return (jsoc_result){
+        .error = {JSOC_ERR_SYNTAX, 0, 1, 1}, .tokens = NULL, .count = 0};
+  }
+  if (JSOC_UNLIKELY(!arena)) {
+    return (jsoc_result){
+        .error = {JSOC_ERR_NOMEM, 0, 1, 1}, .tokens = NULL, .count = 0};
+  }
+  if (JSOC_UNLIKELY(!tokens_fit_u32(length))) {
+    return (jsoc_result){.error = {JSOC_ERR_INPUT_TOO_LARGE, 0, 1, 1},
+                         .tokens = NULL,
+                         .count = 0};
+  }
+
+#if JSOC_SIMD_AVX2
+  /* Same 64-byte cut-over as the strict path. */
+  if (length >= 64) {
+    return jsoc_tokenize_simd_stream_impl(input, length, arena, overflow_token);
+  }
+#endif
+  return jsoc_tokenize_scalar_stream_impl(input, length, arena, overflow_token);
+}
+
+/* Compact stream dispatcher: what `jsoc_parse_many` consumes.  Validation is
+ * that of `jsoc_tokenize_stream_checked`; ',' and ':' are not stored. */
+JSOC_INTERNAL jsoc_result
+jsoc_tokenize_stream_compact_checked(const char *input, size_t length,
+                                     jsoc_arena *arena,
+                                     size_t *overflow_token) {
+  if (overflow_token)
+    *overflow_token = SIZE_MAX;
+  if (JSOC_UNLIKELY(!input || length == 0)) {
+    return (jsoc_result){
+        .error = {JSOC_ERR_SYNTAX, 0, 1, 1}, .tokens = NULL, .count = 0};
+  }
+  if (JSOC_UNLIKELY(!arena)) {
+    return (jsoc_result){
+        .error = {JSOC_ERR_NOMEM, 0, 1, 1}, .tokens = NULL, .count = 0};
+  }
+  if (JSOC_UNLIKELY(!tokens_fit_u32(length))) {
+    return (jsoc_result){.error = {JSOC_ERR_INPUT_TOO_LARGE, 0, 1, 1},
+                         .tokens = NULL,
+                         .count = 0};
+  }
+
+#if JSOC_SIMD_AVX2
+  if (length >= 64) {
+    return jsoc_tokenize_simd_stream_compact_impl(input, length, arena,
+                                                  overflow_token);
+  }
+#endif
+  return jsoc_tokenize_scalar_stream_compact_impl(input, length, arena,
+                                                  overflow_token);
+}
+
+/* Compact variant of the checked dispatcher: ',' and ':' are validated but
+ * not stored, which is what the DOM consumes.  Errors are identical to
+ * `jsoc_tokenize_checked` - only the stream differs. */
+JSOC_INTERNAL jsoc_result jsoc_tokenize_compact_checked(const char *input,
+                                                        size_t length,
+                                                        jsoc_arena *arena,
+                                                        size_t *overflow_token) {
+  if (overflow_token)
+    *overflow_token = SIZE_MAX;
+  if (JSOC_UNLIKELY(!input || length == 0)) {
+    return (jsoc_result){
+        .error = {JSOC_ERR_SYNTAX, 0, 1, 1}, .tokens = NULL, .count = 0};
+  }
+  if (JSOC_UNLIKELY(!arena)) {
+    return (jsoc_result){
+        .error = {JSOC_ERR_NOMEM, 0, 1, 1}, .tokens = NULL, .count = 0};
+  }
+  if (JSOC_UNLIKELY(!tokens_fit_u32(length))) {
+    return (jsoc_result){.error = {JSOC_ERR_INPUT_TOO_LARGE, 0, 1, 1},
+                         .tokens = NULL,
+                         .count = 0};
+  }
+
+#if JSOC_SIMD_AVX2
+  /* Same 64-byte cut-over as the other paths. */
+  if (length >= 64) {
+    return jsoc_tokenize_simd_compact_impl(input, length, arena, overflow_token);
+  }
+#endif
+  return jsoc_tokenize_scalar_compact_impl(input, length, arena, overflow_token);
 }
 
 /* Internal entry point used by the DOM: identical token stream, plus the token

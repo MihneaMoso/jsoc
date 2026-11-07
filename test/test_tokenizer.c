@@ -693,17 +693,9 @@ static uint32_t fuzz_rand(void) {
 static const unsigned char fuzz_bytes[] =
     "{}[]:,\"0123456789-+.eE truefalsn\\/bfnrtu\x01\x1f\x7f\x80\xc3\xa9";
 
-static bool fuzz_same(const char *s, size_t n) {
-  jsoc_arena *a1 = jsoc_arena_create(4096);
-  jsoc_arena *a2 = jsoc_arena_create(4096);
-  if (!a1 || !a2) {
-    jsoc_arena_destroy(a1);
-    jsoc_arena_destroy(a2);
-    return false;
-  }
-
-  jsoc_result r1 = jsoc_tokenize_simd_impl(s, n, a1);
-  jsoc_result r2 = jsoc_tokenize_scalar_impl(s, n, a2);
+/* Compare two results for exact agreement. */
+static bool fuzz_same_one(jsoc_result r1, jsoc_result r2, const char *s,
+                          size_t n, const char *what) {
   bool same = r1.error.code == r2.error.code &&
               r1.error.offset == r2.error.offset && r1.count == r2.count;
   if (same) {
@@ -716,11 +708,10 @@ static bool fuzz_same(const char *s, size_t n) {
       }
     }
   }
-
   if (!same) {
-    printf("simd(code=%d off=%u cnt=%zu) scalar(code=%d off=%u cnt=%zu)\n  "
+    printf("%s: simd(code=%d off=%u cnt=%zu) scalar(code=%d off=%u cnt=%zu)\n  "
            "input: ",
-           (int)r1.error.code, (unsigned)r1.error.offset, r1.count,
+           what, (int)r1.error.code, (unsigned)r1.error.offset, r1.count,
            (int)r2.error.code, (unsigned)r2.error.offset, r2.count);
     for (size_t i = 0; i < n; i++) {
       unsigned char c = (unsigned char)s[i];
@@ -732,10 +723,97 @@ static bool fuzz_same(const char *s, size_t n) {
     }
     putchar('\n');
   }
-
-  jsoc_arena_destroy(a1);
-  jsoc_arena_destroy(a2);
   return same;
+}
+
+/* The compact stream drops ',' and ':' tokens; everything else about it must
+ * be identical to the strict stream, including the error and the partial
+ * token prefix. */
+static bool fuzz_same_compact(jsoc_result compact, jsoc_result strict,
+                              const char *s, size_t n) {
+  bool same = compact.error.code == strict.error.code &&
+              compact.error.offset == strict.error.offset;
+  if (same) {
+    size_t j = 0;
+    for (size_t i = 0; i < strict.count; i++) {
+      if (strict.tokens[i].type == JSOC_TOK_COMMA ||
+          strict.tokens[i].type == JSOC_TOK_COLON) {
+        continue;
+      }
+      if (j >= compact.count ||
+          compact.tokens[j].type != strict.tokens[i].type ||
+          compact.tokens[j].offset != strict.tokens[i].offset ||
+          compact.tokens[j].length != strict.tokens[i].length) {
+        same = false;
+        break;
+      }
+      j++;
+    }
+    if (same && j != compact.count) {
+      same = false;
+    }
+  }
+  if (!same) {
+    printf("compact(strict code=%d off=%u cnt=%zu) code=%d off=%u cnt=%zu\n  "
+           "input: ",
+           (int)strict.error.code, (unsigned)strict.error.offset, strict.count,
+           (int)compact.error.code, (unsigned)compact.error.offset,
+           compact.count);
+    for (size_t i = 0; i < n; i++) {
+      unsigned char c = (unsigned char)s[i];
+      if (c >= 0x20 && c < 0x7f && c != '\\') {
+        putchar(c);
+      } else {
+        printf("\\x%02x", (unsigned)c);
+      }
+    }
+    putchar('\n');
+  }
+  return same;
+}
+
+/* Both backends, every mode (strict, checked, stream, compact) must agree
+ * exactly: error code, offset, token count and every token field. */
+static bool fuzz_same(const char *s, size_t n) {
+  jsoc_arena *a[8];
+  for (size_t i = 0; i < 8; i++) {
+    a[i] = jsoc_arena_create(4096);
+    if (!a[i]) {
+      for (size_t j = 0; j < i; j++) {
+        jsoc_arena_destroy(a[j]);
+      }
+      return false;
+    }
+  }
+
+  size_t overflow;
+  const jsoc_result strict_simd = jsoc_tokenize_simd_impl(s, n, a[0]);
+  const jsoc_result strict_scalar = jsoc_tokenize_scalar_impl(s, n, a[1]);
+  const jsoc_result checked_simd =
+      jsoc_tokenize_simd_checked_impl(s, n, a[2], NULL);
+  const jsoc_result checked_scalar =
+      jsoc_tokenize_scalar_checked_impl(s, n, a[3], NULL);
+  const jsoc_result stream_simd =
+      jsoc_tokenize_simd_stream_impl(s, n, a[4], NULL);
+  const jsoc_result stream_scalar =
+      jsoc_tokenize_scalar_stream_impl(s, n, a[5], NULL);
+  const jsoc_result compact_simd =
+      jsoc_tokenize_simd_compact_impl(s, n, a[6], &overflow);
+  const jsoc_result compact_scalar =
+      jsoc_tokenize_scalar_compact_impl(s, n, a[7], &overflow);
+
+  const bool ok =
+      fuzz_same_one(strict_simd, strict_scalar, s, n, "strict") &&
+      fuzz_same_one(checked_simd, checked_scalar, s, n, "checked") &&
+      fuzz_same_one(stream_simd, stream_scalar, s, n, "stream") &&
+      /* Compact must be identical between backends, and agree with strict. */
+      fuzz_same_one(compact_simd, compact_scalar, s, n, "compact") &&
+      fuzz_same_compact(compact_simd, strict_simd, s, n);
+
+  for (size_t i = 0; i < 8; i++) {
+    jsoc_arena_destroy(a[i]);
+  }
+  return ok;
 }
 
 /* Generate a random (usually valid) JSON document. */
@@ -919,9 +997,12 @@ static bool test_differential_fuzz(void) {
           buf[n++] = '\\';
           buf[n++] = "\"\\/bfnrtu "[fuzz_rand() % 10u];
         } else if (t < 15) {
-          buf[n++] = (char)"\x01\x1f\x7f"[fuzz_rand() % 3u];
+          static const char controls[] = {0x01, 0x1f, 0x7f};
+          buf[n++] = controls[fuzz_rand() % 3u];
         } else {
-          buf[n++] = "abcXYZ019 \t"[fuzz_rand() % 13u];
+          static const char plain[] = {'a', 'b', 'c', 'X', 'Y', 'Z',
+                                       '0', '1', '9', ' ', '\t'};
+          buf[n++] = plain[fuzz_rand() % (sizeof plain)];
         }
       }
       if (fuzz_rand() % 12u != 0)

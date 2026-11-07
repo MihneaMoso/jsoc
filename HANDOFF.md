@@ -21,14 +21,15 @@ Continuation notes for the C23 JSON library rewrite.
 
 | fixture | size | jsoc parse | simdjson DOM | jsoc/simdjson |
 |---|---:|---:|---:|---:|
-| twitter | 0.63 MB | 0.241 ms / 2.62 GB/s | 0.175 ms / 3.62 GB/s | 1.38x |
-| citm_catalog | 1.73 MB | 0.636 ms / 2.72 GB/s | 0.454 ms / 3.81 GB/s | 1.40x |
-| canada | 2.25 MB | 1.807 ms / 1.25 GB/s | 1.792 ms / 1.25 GB/s | 1.01x |
-| gsoc-2018 | 3.33 MB | 0.685 ms / 4.86 GB/s | 0.724 ms / 4.60 GB/s | 0.95x |
+| twitter | 0.63 MB | 0.245 ms / 2.58 GB/s | 0.174 ms / 3.64 GB/s | 1.41x |
+| citm_catalog | 1.73 MB | 0.642 ms / 2.69 GB/s | 0.456 ms / 3.79 GB/s | 1.41x |
+| canada | 2.25 MB | 1.813 ms / 1.24 GB/s | 1.788 ms / 1.26 GB/s | 1.01x |
+| gsoc-2018 | 3.33 MB | 0.665 ms / 5.00 GB/s | 0.720 ms / 4.62 GB/s | 0.92x |
 
 jsoc is at parity or ahead on gsoc/canada and ~40 % behind on twitter/citm.
-The gap is in the tokenizer, not the DOM: jsoc emits a 12-byte token per token
-(including separators), while simdjson stage 1 only writes structural indexes.
+The gap is in the tokenizer, not the DOM: the DOM path stores a 12-byte token
+per value/container/quote (separators are validated but dropped), while
+simdjson builds its DOM straight from the stage 1/2 masks.
 
 ## Build / test / bench / corpus
 
@@ -93,15 +94,47 @@ src/
   dom_internal.h private 16-byte jsoc_value / jsoc_member layout
   tokenizer_internal.h hidden backend entry points (used by the tests)
 test/
-  test_tokenizer.c  29 tests incl. differential fuzzing
-  test_dom.c         21 tests for DOM/pointer/writer/minify/cursor/decode
-  corpus.c          acceptance-corpus runner with DOM integrity checks
+  test.h             shared harness (TEST/REQUIRE, file readers, xorshift64)
+  test_tokenizer.c   29 tests incl. the differential fuzzer, which compares
+                     the SIMD and portable backends in all three modes
+                     (strict, checked, stream)
+  test_dom.c          21 tests: DOM, pointer, writer, minify, cursor, decode
+  test_numbers.c     15 tests (see TESTING.md for the simdjson mapping)
+  test_errors.c       6 tests
+  test_stream.c       8 tests
+  test_pointer.c      6 tests (RFC 6901 vectors)
+  test_minify.c       3 tests (reference escaper + corpus round-trip)
+  test_padding.c      8 tests (exact-size buffers)
+  test_unicode.c      3 tests (random UTF-8 generator)
+  test_static.c       4 tests (sizes, offsets, trivial copyability)
+  corpus.c           acceptance-corpus runner with DOM integrity checks
+fuzz/
+  fuzz.c             9 standalone fuzz targets; libFuzzer-compatible
+scripts/
+  fetch-testdata.sh  clones jsonchecker / jsonexamples / JSONTestSuite
 bench/
   bench.c            native throughput benchmark
   compare.sh         build+run the simdjson comparison
   compare_simdjson.cpp  the comparison harness (not built by default)
+.github/workflows/
+  ci.yml             build matrix + fuzz smoke + corpora + sanitizers
+TESTING.md           the simdjson port mapping, and what is not ported
 legacy/              the old implementation; reference only, never built
 ```
+
+Running:
+
+```bash
+make test            # every suite
+make corpus          # acceptance corpora (make fetch-testdata first)
+make fuzz            # bounded deterministic fuzz run
+make check           # all of the above under ASan+UBSan
+make fetch-testdata  # one-time corpus download
+make install         # /usr/local + a pkg-config file
+```
+
+`build/.cflags` stamps the effective command line, so switching between
+debug/asan/release never mixes objects from different flag sets.
 
 ## Data model / invariants
 
@@ -280,21 +313,34 @@ Rejected experiments (do not redo without a new measurement):
 - auto-vectorization (`VECTORIZE=1`): slower;
 - `loop_width` / function / loop alignment flags: slower or neutral;
 - PGO (`-fprofile-generate/-use`): the profile did not apply to the object
-  paths and showed no benefit.
+  paths and showed no benefit;
+- caching one 16-byte digit mask across a number's integer/fraction/exponent
+  runs: 8–12 % slower (extra mask setup and spills outweigh the saved loads);
+- adding a digit mask to `jsoc_classify64`: 3–16 % slower (stage 1 is latency
+  bound and every block pays, while only number-heavy blocks benefit);
+- forcing `fused_process_block` inline so compact mode constant-folds: neutral
+  and ~30 % larger `.text`, so the out-of-line block stays.
 
 ### Where the remaining gap is
 
-twitter/citm are separator-heavy: 37–46 % of their tokens are `,` and `:`. The
-DOM does not need those tokens, so the cheapest remaining experiment is a
-DOM-only tokenizer mode that still validates the grammar (through the same
-`grammar_step`) but does not push separator tokens, with `dom.c` adapting. The
-public token stream must stay unchanged; only the internal path would differ.
+The DOM now consumes a **compact token stream**: `jsoc_parse` and
+`jsoc_parse_many` use `jsoc_tokenize_compact_checked`, which validates `,` and
+`:` through the same grammar but does not store them (37–46 % of tokens on
+twitter/citm). The public `jsoc_tokenize` stream is unchanged. Measured effect
+(release-native, same-process compare): citm 1.45x → 1.41x, twitter unchanged
+at 1.41x, canada 1.01x, gsoc 0.92x. Separator stores were never the main cost
+(count-only experiment: 2–9 %), so the remaining twitter/citm gap is the
+materialisation of 12-byte tokens and the tokenize/DOM split itself: simdjson
+builds its DOM directly from stage 1/2 masks, while jsoc first writes a token
+array and then walks it. The next structural win is a mask-driven DOM builder
+that skips the token array for the common cases, not more micro-tuning of the
+existing emit loop.
 
 ## Next work
 
-1. **Close the twitter/citm gap** with the DOM-only separator-free tokenizer
-   mode described above. Measure first with the separator-store experiment
-   (removing `fused_emit` for `,`/`:` only) before touching the builder.
+1. **Mask-driven DOM construction** (the structural change described above) if
+   the twitter/citm gap must be closed further. Keep the token-walking builder
+   as the reference implementation and the error oracle.
 2. **Fuse UTF-8 validation into stage 1.** `jsoc_validate_utf8` is already fast,
    but it currently re-reads every byte of the document.
 3. **`jsoc_parse` streaming/sliced mode** for On-Demand-style paging

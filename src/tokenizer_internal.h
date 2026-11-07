@@ -28,6 +28,49 @@ JSOC_INTERNAL jsoc_result jsoc_tokenize_simd_checked_impl(const char *input,
                                                           jsoc_arena *arena,
                                                           size_t *overflow_token);
 
+/* Stream variants: identical token streams, except that a second top-level
+ * value is accepted *without* whitespace after the first one, which is what
+ * `jsoc_parse_many` needs for ndjson (simdjson's parse_many accepts adjacent
+ * documents; `jsoc_tokenize` still rejects them). */
+JSOC_INTERNAL jsoc_result jsoc_tokenize_scalar_stream_impl(const char *input,
+                                                           size_t length,
+                                                           jsoc_arena *arena,
+                                                           size_t *overflow_token);
+JSOC_INTERNAL jsoc_result jsoc_tokenize_simd_stream_impl(const char *input,
+                                                         size_t length,
+                                                         jsoc_arena *arena,
+                                                         size_t *overflow_token);
+JSOC_INTERNAL jsoc_result jsoc_tokenize_stream_checked(const char *input,
+                                                       size_t length,
+                                                       jsoc_arena *arena,
+                                                       size_t *overflow_token);
+JSOC_INTERNAL jsoc_result jsoc_tokenize_scalar_stream_compact_impl(
+    const char *input, size_t length, jsoc_arena *arena,
+    size_t *overflow_token);
+JSOC_INTERNAL jsoc_result
+jsoc_tokenize_simd_stream_compact_impl(const char *input, size_t length,
+                                       jsoc_arena *arena,
+                                       size_t *overflow_token);
+JSOC_INTERNAL jsoc_result jsoc_tokenize_stream_compact_checked(
+    const char *input, size_t length, jsoc_arena *arena,
+    size_t *overflow_token);
+
+/* Compact variant: same validation and the same errors as
+ * `jsoc_tokenize_checked`, but ',' and ':' are not stored, because the DOM
+ * infers them from the container. */
+JSOC_INTERNAL jsoc_result jsoc_tokenize_scalar_compact_impl(const char *input,
+                                                            size_t length,
+                                                            jsoc_arena *arena,
+                                                            size_t *overflow_token);
+JSOC_INTERNAL jsoc_result jsoc_tokenize_simd_compact_impl(const char *input,
+                                                          size_t length,
+                                                          jsoc_arena *arena,
+                                                          size_t *overflow_token);
+JSOC_INTERNAL jsoc_result jsoc_tokenize_compact_checked(const char *input,
+                                                        size_t length,
+                                                        jsoc_arena *arena,
+                                                        size_t *overflow_token);
+
 /* True when this build contains the AVX2 stage-1 tokenizer. */
 JSOC_INTERNAL bool jsoc_tokenizer_simd_available(void);
 

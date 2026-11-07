@@ -32,7 +32,9 @@ make debug           # -O0 -g3
 make asan            # ASan + UBSan
 make PORTABLE=1 release   # force the scalar backends (no SIMD)
 
-make test            # test_tokenizer + test_dom
+make test            # every suite (10 binaries, 103 tests)
+make fuzz            # bounded deterministic fuzz run
+make fetch-testdata  # one-time corpus download
 make bench           # throughput benchmark (BENCH_ARGS / BENCH_ITERS)
 make corpus          # acceptance corpora (CORPUS_ARGS)
 make check           # build asan and run the tests
@@ -88,4 +90,5 @@ legacy/   the old implementation; reference only, not built
 ```
 
 `HANDOFF.md` documents the invariants, the performance work that has already
-been measured, and what is worth trying next.
+been measured, and what is worth trying next. `TESTING.md` maps every test to
+the simdjson test file it came from, and lists what is deliberately not ported.

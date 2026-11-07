@@ -57,6 +57,13 @@ static expectation expectation_for(const char *path) {
   if (strncmp(name, "n_", 2) == 0 || strncmp(name, "fail", 4) == 0) {
     return EXPECT_ERROR;
   }
+  /* A file with no naming convention at all is scored by the directory it
+   * lives in: simdjson's jsonexamples/ holds real-world documents, every one
+   * of which must parse, so it defaults to EXPECT_OK there. */
+  if (strstr(path, "/jsonexamples/") != NULL ||
+      has_suffix(path, "/jsonexamples")) {
+    return EXPECT_OK;
+  }
   return EXPECT_DONT_CARE;
 }
 

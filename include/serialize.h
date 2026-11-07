@@ -27,6 +27,11 @@ JSOC_API bool jsoc_minify(const char *input, size_t length, jsoc_arena *arena,
 JSOC_API bool jsoc_document_minify(const jsoc_document *doc, jsoc_arena *arena,
                                    jsoc_string *out) JSOC_NODISCARD;
 
+/* Re-emit just one value (a subtree), not the whole document. */
+JSOC_API bool jsoc_value_minify(const jsoc_document *doc, const jsoc_value *v,
+                                jsoc_arena *arena,
+                                jsoc_string *out) JSOC_NODISCARD;
+
 #ifdef __cplusplus
 }
 #endif

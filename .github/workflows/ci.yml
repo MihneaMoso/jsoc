@@ -1,0 +1,118 @@
+# Build, test and fuzz across compilers and configurations.
+#
+# This is the jsoc-side equivalent of simdjson's .github/workflows/ubuntu24-*.yml
+# matrix (compiler x build type x sanitizer), collapsed to what this project
+# actually builds: a C library with one scalar backend and one AVX2 backend.
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.cxx }}/${{ matrix.build }}${{ matrix.portable && '/portable' || '' }}${{ matrix.sanitize && '/sanitize' || '' }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        cxx: [gcc, clang]
+        build: [release, release-native, debug]
+        sanitize: [ON]
+        portable: [ON]
+        exclude:
+          # Sanitizers only make sense on one compiler, and the native build
+          # has no value under them.
+          - cxx: clang
+            build: release-native
+            sanitize: ON
+          - cxx: gcc
+            build: release-native
+            sanitize: ON
+          - cxx: clang
+            build: debug
+            sanitize: ON
+    env:
+      CC: ${{ matrix.cxx }}
+      CXX: ${{ matrix.cxx == 'gcc' && 'g++' || 'clang++' }}
+      # Hosts for the natural build only; the portable one must not pick up
+      # -march=native implicitly.
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: |
+          args="${{ matrix.build }}"
+          if [ "${{ matrix.portable }}" = "ON" ]; then args="PORTABLE=1 $args"; fi
+          if [ "${{ matrix.sanitize }}" = "ON" ]; then
+            args="$args EXTRA_CFLAGS=-fsanitize=address,undefined"
+            args="$args EXTRA_LDFLAGS=-fsanitize=address,undefined"
+          fi
+          echo "MAKE_ARGS=$args" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: make $MAKE_ARGS
+
+      - name: Test
+        run: |
+          make $MAKE_ARGS test
+          ./build/test_tokenizer
+          ./build/test_dom
+          for t in numbers errors stream pointer minify padding unicode static; do
+            ./build/test_$t
+          done
+
+      - name: Fuzz (bounded)
+        run: make fuzz FUZZ_ITERS=2000 FUZZ_TARGET=all
+
+      - name: Bench (sanity)
+        run: ./build/bench /etc/hostname >/dev/null || true
+
+  corpus:
+    name: conformance corpora
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch test data
+        run: |
+          scripts/fetch-testdata.sh
+          echo "TEST_DATA=/tmp/opencode/simdjson-data" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: make release-native
+
+      - name: jsonchecker + JSONTestSuite
+        run: |
+          make corpus CORPUS_ARGS=/tmp/opencode/simdjson-data/jsonchecker /tmp/opencode/simdjson-data/JSONTestSuite/test_parsing | tee /tmp/corpus.txt
+          if grep -q 'unexpected_pass=[^0]\|unexpected_fail=[^0]\|broken_dom=[^0]' /tmp/corpus.txt; then
+            echo "::error::corpus reported an unexpected result"; exit 1
+          fi
+
+      - name: jsonexamples all parse
+        run: |
+          ./build/corpus /tmp/opencode/simdjson-data/jsonexamples | tee /tmp/examples.txt
+          if grep -q 'unexpected_pass=[^0]\|unexpected_fail=[^0]\|broken_dom=[^0]' /tmp/examples.txt; then
+            echo "::error::a real-world document failed to parse"; exit 1
+          fi
+
+  sanitizers:
+    name: ASan + UBSan (every suite)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and run
+        run: |
+          make asan
+          ./build/test_tokenizer
+          ./build/test_dom
+          for t in numbers errors stream pointer minify padding unicode static; do
+            ./build/test_$t
+          done
+          make fuzz FUZZ_ITERS=500

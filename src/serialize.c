@@ -68,9 +68,17 @@ static bool write_value_text(jsoc_writer *w, const jsoc_document *doc,
 
 JSOC_API bool jsoc_document_minify(const jsoc_document *doc, jsoc_arena *arena,
                                    jsoc_string *out) {
+  if (!doc || !doc->root) {
+    return false;
+  }
+  return jsoc_value_minify(doc, doc->root, arena, out);
+}
+
+JSOC_API bool jsoc_value_minify(const jsoc_document *doc, const jsoc_value *v,
+                                jsoc_arena *arena, jsoc_string *out) {
   if (out)
     *out = (jsoc_string){NULL, 0};
-  if (!doc || !arena || !out || doc->error.code != JSOC_OK || !doc->root) {
+  if (!doc || !arena || !out || !v) {
     return false;
   }
 
@@ -81,7 +89,7 @@ JSOC_API bool jsoc_document_minify(const jsoc_document *doc, jsoc_arena *arena,
   if (!w.buffer)
     return false;
 
-  if (!write_value_text(&w, doc, doc->root) || w.failed)
+  if (!write_value_text(&w, doc, v) || w.failed)
     return false;
 
   const size_t n = jsoc_writer_size(&w);

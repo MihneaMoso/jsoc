@@ -90,11 +90,8 @@ static uint32_t dom_build_array(dom_builder *b) {
     }
     prev = child;
     count++;
-    if (JSOC_LIKELY(b->tokens[b->pos].type == JSOC_TOK_COMMA)) {
-      b->pos++;
-    } else {
-      break;
-    }
+    /* Compact stream: no ',' token.  The tokenizer already rejected a
+     * missing separator, so the next element simply starts here. */
   }
   b->pos++; /* ']' */
   v->first = first;
@@ -120,7 +117,7 @@ static uint32_t dom_build_object(dom_builder *b) {
     if (b->tokens[b->pos].type != JSOC_TOK_STRING)
       break; /* '}' */
     const jsoc_token key = b->tokens[b->pos++];
-    b->pos++; /* ':' */
+    /* Compact stream: the ':' is implied by the tokenizer's grammar. */
     const uint32_t child = dom_build_value(b);
 
     const uint32_t m = b->next_member++;
@@ -136,12 +133,7 @@ static uint32_t dom_build_object(dom_builder *b) {
     }
     prev = m;
     count++;
-
-    if (JSOC_LIKELY(b->tokens[b->pos].type == JSOC_TOK_COMMA)) {
-      b->pos++;
-    } else {
-      break;
-    }
+    /* Compact stream: no ',' token; the loop re-checks for a key. */
   }
   b->pos++; /* '}' */
   v->first = first;
@@ -177,12 +169,13 @@ static bool dom_build_document(jsoc_document *doc, const jsoc_token *tokens,
                                size_t overflow_token, jsoc_arena *arena,
                                size_t *out_end) {
   const size_t remaining = limit - start;
-  /* Every value is a scalar token or a container-begin token and is
-   * separated from the next by at least one structural token.  Likewise
-   * every member costs at least key + ':' + value.  These bounds remove the
-   * exact counting pass; only the used prefix is touched. */
-  const size_t value_cap = remaining / 2 + 1;
-  const size_t member_cap = remaining / 4 + 1;
+  /* The token stream is compact, so a token is either a value (a scalar or a
+   * container begin) or a close: `remaining` is therefore a safe upper bound
+   * on the value count.  A member costs at least key + value, so half of that
+   * bounds the member count.  Only the used prefix of each array is touched,
+   * and no exact counting pass is needed. */
+  const size_t value_cap = remaining;
+  const size_t member_cap = remaining / 2 + 1;
 
   doc->values = jsoc_arena_alloc_t(arena, jsoc_value, value_cap);
   doc->members = jsoc_arena_alloc_t(arena, jsoc_member, member_cap);
@@ -425,6 +418,36 @@ static size_t dom_skip_value(const jsoc_token *tokens, size_t start,
   return i;
 }
 
+/* True when the value at `start` is complete inside [start, limit): a scalar
+ * token, or a container whose closing token is present.  The streaming path
+ * walks a truncated token stream after a tokenizer error, so a document that
+ * never finished must be recognised rather than built. */
+static bool dom_value_complete(const jsoc_token *tokens, size_t start,
+                               size_t limit, size_t *out_end) {
+  if (start >= limit)
+    return false;
+  const jsoc_token_type type = tokens[start].type;
+  if (type != JSOC_TOK_OBJ_BEGIN && type != JSOC_TOK_ARR_BEGIN) {
+    *out_end = start + 1;
+    return true;
+  }
+  const size_t end = dom_skip_value(tokens, start, limit);
+  if (end > limit)
+    return false;
+  /* A container ends with its closing token only when the depth closed
+   * exactly, i.e. the token before `end` is a closer. */
+  if (end == start + 1)
+    return false;
+  const jsoc_token_type last = tokens[end - 1].type;
+  const bool closed =
+      (type == JSOC_TOK_OBJ_BEGIN && last == JSOC_TOK_OBJ_END) ||
+      (type == JSOC_TOK_ARR_BEGIN && last == JSOC_TOK_ARR_END);
+  if (!closed)
+    return false;
+  *out_end = end;
+  return true;
+}
+
 JSOC_API jsoc_document jsoc_parse(const char *input, size_t length,
                                   jsoc_arena *arena) {
   jsoc_document doc;
@@ -452,7 +475,10 @@ JSOC_API jsoc_document jsoc_parse(const char *input, size_t length,
   }
 
   size_t overflow_token = SIZE_MAX;
-  jsoc_result r = jsoc_tokenize_checked(input, length, arena, &overflow_token);
+  /* Compact mode: separators are validated by the tokenizer but not stored,
+   * so the container loops below need no comma/colon bookkeeping. */
+  jsoc_result r =
+      jsoc_tokenize_compact_checked(input, length, arena, &overflow_token);
   if (JSOC_UNLIKELY(r.error.code != JSOC_OK)) {
     doc.error = r.error;
     return doc;
@@ -479,18 +505,44 @@ JSOC_API jsoc_document jsoc_parse(const char *input, size_t length,
   return doc;
 }
 
+static jsoc_error stream_run(jsoc_token *tokens, size_t limit,
+                             const char *input, size_t length,
+                             jsoc_arena *arena, size_t overflow_token,
+                             jsoc_document_callback callback, void *user,
+                             jsoc_error *fatal);
+
+/* Whitespace per JSON (space, tab, LF, CR).  Mirrors jsoc_is_ws in simd.h. */
+static inline bool dom_is_ws(unsigned char c) {
+  return c == ' ' || c == '\t' || c == '\n' || c == '\r';
+}
+
 JSOC_API jsoc_error jsoc_parse_many(const char *input, size_t length,
                                     jsoc_arena *arena,
                                     jsoc_document_callback callback,
                                     void *user) {
-  if (JSOC_UNLIKELY(!input || length == 0)) {
+  if (JSOC_UNLIKELY(!input)) {
     return (jsoc_error){JSOC_ERR_SYNTAX, 0, 1, 1};
+  }
+  /* An empty input is an empty stream, not an error (simdjson agrees). */
+  if (JSOC_UNLIKELY(length == 0)) {
+    return (jsoc_error)JSOC_ERR_INIT;
   }
   if (JSOC_UNLIKELY(!arena)) {
     return (jsoc_error){JSOC_ERR_NOMEM, 0, 1, 1};
   }
   if (JSOC_UNLIKELY(length > (size_t)UINT32_MAX)) {
     return (jsoc_error){JSOC_ERR_INPUT_TOO_LARGE, 0, 1, 1};
+  }
+
+  /* A UTF-8 BOM is accepted once, at the very start of the stream.  It is
+   * not whitespace, so every later stage would reject it. */
+  if (length >= 3 && (unsigned char)input[0] == 0xEF &&
+      (unsigned char)input[1] == 0xBB && (unsigned char)input[2] == 0xBF) {
+    input += 3;
+    length -= 3;
+    if (JSOC_UNLIKELY(length == 0)) {
+      return (jsoc_error){JSOC_ERR_SYNTAX, 0, 1, 1};
+    }
   }
 
   size_t utf8_offset = 0;
@@ -505,10 +557,49 @@ JSOC_API jsoc_error jsoc_parse_many(const char *input, size_t length,
   }
 
   size_t overflow_token = SIZE_MAX;
-  jsoc_result r =
-      jsoc_tokenize_checked(input, length, token_arena, &overflow_token);
+  /* Stream mode: documents in a stream may be adjacent, which
+   * `jsoc_tokenize_checked` would reject as trailing garbage.  Compact so the
+   * DOM builder sees the same separator-free stream as `jsoc_parse`. */
+  jsoc_result r = jsoc_tokenize_stream_compact_checked(
+      input, length, token_arena, &overflow_token);
   if (JSOC_UNLIKELY(r.error.code != JSOC_OK)) {
+    /* The whole input is tokenized before the first callback, so replay
+     * the well-formed prefix that precedes the offending byte: the caller
+     * then sees every complete document followed by the error, which is
+     * what simdjson's document stream does.  A prefix that is itself
+     * invalid (an unterminated document next to the bad bytes) leaves
+     * nothing, so a truncated document is never exposed. */
     jsoc_error err = r.error;
+
+    /* Whitespace-only input is an empty stream, not an error. */
+    if (err.code == JSOC_ERR_EXPECTED_VALUE) {
+      bool any_value = false;
+      for (size_t i = 0; i < length; i++) {
+        if (!dom_is_ws((unsigned char)input[i])) {
+          any_value = true;
+          break;
+        }
+      }
+      if (!any_value) {
+        jsoc_arena_destroy(token_arena);
+        return (jsoc_error)JSOC_ERR_INIT;
+      }
+    }
+
+    /* A document that opened before the error is never delivered: the
+     * partial stream stops where the tokenizer did, so only complete
+     * documents are walked. */
+    if (JSOC_LIKELY(r.count > 1)) {
+      jsoc_error fatal = (jsoc_error)JSOC_ERR_INIT;
+      const jsoc_error delivered =
+          stream_run(r.tokens, r.count, input, length, arena, overflow_token,
+                     callback, user, &fatal);
+      jsoc_arena_destroy(token_arena);
+      if (delivered.code != JSOC_OK) {
+        return delivered;
+      }
+      return err;
+    }
     jsoc_arena_destroy(token_arena);
     return err;
   }
@@ -517,10 +608,31 @@ JSOC_API jsoc_error jsoc_parse_many(const char *input, size_t length,
     return jsoc_error_at_offset(input, length, JSOC_ERR_EXPECTED_VALUE, length);
   }
 
-  const size_t limit = r.count - 1; /* EOF */
+  jsoc_error end_err = (jsoc_error)JSOC_ERR_INIT;
+  const jsoc_error result =
+      stream_run(r.tokens, r.count - 1, input, length, arena, overflow_token,
+                 callback, user, &end_err);
+  /* The tokens live in `token_arena`, which must outlive stream_run but not
+   * its return value. */
+  jsoc_arena_destroy(token_arena);
+  return result;
+}
+
+/* Deliver one document at a time from the token stream [0, limit).  On
+ * failure *fatal receives the error and no further document is delivered. */
+static jsoc_error stream_run(jsoc_token *tokens, size_t limit,
+                             const char *input, size_t length,
+                             jsoc_arena *arena, size_t overflow_token,
+                             jsoc_document_callback callback, void *user,
+                             jsoc_error *fatal) {
   size_t start = 0;
   while (start < limit) {
-    const size_t hint = dom_skip_value(r.tokens, start, limit);
+    size_t hint = 0;
+    if (!dom_value_complete(tokens, start, limit, &hint)) {
+      /* A truncated trailing document is not delivered: the caller gets
+       * the error instead. */
+      break;
+    }
 
     jsoc_arena_reset(arena);
     jsoc_document doc;
@@ -531,25 +643,31 @@ JSOC_API jsoc_error jsoc_parse_many(const char *input, size_t length,
     doc.arena = arena;
 
     size_t end = start;
-    if (JSOC_UNLIKELY(!dom_build_document(&doc, r.tokens, start, hint,
+    if (JSOC_UNLIKELY(!dom_build_document(&doc, tokens, start, hint,
                                           overflow_token, arena, &end))) {
-      jsoc_error err = doc.error;
-      jsoc_arena_destroy(token_arena);
-      return err;
+      if (fatal) {
+        *fatal = doc.error;
+      }
+      return doc.error;
     }
     if (JSOC_UNLIKELY(end <= start)) {
-      jsoc_arena_destroy(token_arena);
-      return jsoc_error_at_offset(input, length, JSOC_ERR_SYNTAX,
-                                  r.tokens[start].offset);
+      jsoc_error err = jsoc_error_at_offset(input, length, JSOC_ERR_SYNTAX,
+                                            tokens[start].offset);
+      if (fatal) {
+        *fatal = err;
+      }
+      return err;
     }
     if (callback && !callback(&doc, user)) {
-      jsoc_arena_destroy(token_arena);
-      return (jsoc_error){JSOC_ERR_USER_STOP, 0, 0, 0};
+      jsoc_error stop = {JSOC_ERR_USER_STOP, 0, 0, 0};
+      if (fatal) {
+        *fatal = stop;
+      }
+      return stop;
     }
     start = end;
   }
 
-  jsoc_arena_destroy(token_arena);
   return (jsoc_error)JSOC_ERR_INIT;
 }
 
