@@ -226,19 +226,18 @@ idx_string(idx_builder *b, uint32_t *offset, uint32_t *length) {
     return false;
   const uint32_t open = b->indexes[p];
   const uint32_t close = b->indexes[p + 1];
-  if (JSOC_UNLIKELY(b->input[open] != '"' || b->input[close] != '"' ||
-                    close <= open)) {
+  /* Both call sites already classified `open` as a quote; `close` is the next
+   * structural start and stage 1 only marks real quotes there. */
+  if (JSOC_UNLIKELY(close <= open))
     return false;
-  }
   *offset = open + 1;
   *length = close - open - 1;
   b->pos = p + 2;
   return true;
 }
 
-static uint32_t idx_literal(idx_builder *b) {
+static uint32_t idx_literal(idx_builder *b, unsigned char c) {
   const uint32_t s = b->indexes[b->pos];
-  const unsigned char c = (unsigned char)b->input[s];
   const char *lit = (c == 't') ? "true" : ((c == 'f') ? "false" : "null");
   const size_t litlen = (c == 'f') ? 5 : 4;
   const jsoc_value_type type = (c == 't')   ? JSOC_VALUE_TRUE
@@ -308,7 +307,7 @@ static inline JSOC_ALWAYS_INLINE uint32_t idx_parse_value(idx_builder *b) {
   if (JSOC_LIKELY(c == '['))
     return idx_parse_array(b);
   if (c == 't' || c == 'f' || c == 'n')
-    return idx_literal(b);
+    return idx_literal(b, c);
   return idx_number(b);
 }
 
