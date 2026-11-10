@@ -253,39 +253,100 @@ static uint32_t idx_literal(idx_builder *b, unsigned char c) {
   return idx_scalar(b, type, s, (uint32_t)litlen);
 }
 
-#ifdef JSOC_EXP_S2_FASTNUM
-static uint32_t idx_number(idx_builder *b) {
-  const uint32_t s = b->indexes[b->pos];
-  size_t end = (b->pos + 1 < b->count) ? b->indexes[b->pos + 1] : b->length;
-  while (end > s) {
-    const unsigned char c = (unsigned char)b->input[end - 1];
-    if (c != ' ' && c != '\t' && c != '\n' && c != '\r')
-      break;
-    end--;
-  }
-  b->pos++;
-  return idx_scalar(b, JSOC_VALUE_NUMBER, s, (uint32_t)(end - s));
-}
-#else
-static uint32_t idx_number(idx_builder *b) {
-  const uint32_t s = b->indexes[b->pos];
+/* Stage 2 already knows each number's extent from the index stream, so a
+ * plain decimal lexeme (no fraction-less range issues, no exponent) can be
+ * proven good from two loads and two movemasks instead of rescanning every
+ * digit.  Anything we cannot prove here (an exponent, a leading zero, more
+ * than one dot, an integer that might not fit int64/uint64, a lexeme longer
+ * than 32 bytes, or one too close to the buffer end) reports false and the
+ * caller runs the authoritative validator, which reproduces the exact error
+ * code, offset and message. */
+static JSOC_NOINLINE __attribute__((cold)) uint32_t
+idx_number_slow(idx_builder *b, uint32_t s) {
   size_t end = 0;
   size_t err_off = 0;
   bool out_of_range = false;
-  const jsoc_error_code ec =
-      jsoc_validate_number_checked(b->input, b->length, s, b->doc->arena, &end, &err_off,
-                           &out_of_range);
-  /* Out-of-range numbers take the slow path so the existing overflow/trailing
-   * document scoping logic stays authoritative. */
-  if (JSOC_UNLIKELY(ec != JSOC_OK || out_of_range ||
-                    !idx_scalar_end(b, end))) {
+  const jsoc_error_code ec = jsoc_validate_number_checked(
+      b->input, b->length, s, b->doc->arena, &end, &err_off, &out_of_range);
+  if (JSOC_UNLIKELY(ec != JSOC_OK || out_of_range || !idx_scalar_end(b, end))) {
     b->fail = true;
     return JSOC_NO_INDEX;
   }
   b->pos++;
   return idx_scalar(b, JSOC_VALUE_NUMBER, s, (uint32_t)(end - s));
 }
-#endif
+
+static inline JSOC_ALWAYS_INLINE uint32_t idx_number(idx_builder *b) {
+  const uint32_t s = b->indexes[b->pos];
+  size_t e = (b->pos + 1 < b->count) ? b->indexes[b->pos + 1] : b->length;
+  while (e > s) {
+    const unsigned char c = (unsigned char)b->input[e - 1];
+    if (c != ' ' && c != '\t' && c != '\n' && c != '\r')
+      break;
+    e--;
+  }
+  const size_t n = e - s;
+  if (JSOC_UNLIKELY(n == 0 || n > 32 || (size_t)s + 32 > b->length))
+    return idx_number_slow(b, s);
+
+  const __m128i zero = _mm_setzero_si128();
+  const __m128i nine = _mm_set1_epi8(9);
+  const __m128i ch0 = _mm_set1_epi8('0');
+  const __m128i v0 = _mm_loadu_si128((const __m128i *)(const void *)(b->input + s));
+  uint32_t dig = (uint32_t)_mm_movemask_epi8(
+                     _mm_cmpeq_epi8(_mm_subs_epu8(_mm_sub_epi8(v0, ch0), nine), zero)) &
+                 ((n >= 16) ? 0xFFFFu : ((1u << n) - 1u));
+  uint32_t full = (n >= 16) ? 0xFFFFu : ((1u << n) - 1u);
+  if (n > 16) {
+    const __m128i v1 =
+        _mm_loadu_si128((const __m128i *)(const void *)(b->input + s + 16));
+    const uint32_t him = (1u << (n - 16)) - 1u;
+    dig |= ((uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(
+                _mm_subs_epu8(_mm_sub_epi8(v1, ch0), nine), zero)) & him)
+           << 16;
+    full |= him << 16;
+  }
+
+  /* Plain unsigned integers are by far the commonest lexeme (ids, counts):
+   * one compare proves there is nothing else in the token, and 18 digits are
+   * always inside uint64. */
+  if (JSOC_LIKELY(dig == full)) {
+    if (JSOC_UNLIKELY(n > 18 || (n > 1 && b->input[s] == '0')))
+      return idx_number_slow(b, s);
+    b->pos++;
+    return idx_scalar(b, JSOC_VALUE_NUMBER, s, (uint32_t)n);
+  }
+
+  /* Non-digit bytes: exactly the optional leading '-', and at most one '.'. */
+  uint32_t nd = ~dig & full;
+  const bool neg = b->input[s] == '-';
+  if (neg)
+    nd &= ~1u;
+  if (JSOC_UNLIKELY(nd & (nd - 1u))) /* two dots, an exponent, or junk */
+    return idx_number_slow(b, s);
+
+  const size_t istart = neg ? 1u : 0u;
+  if (nd == 0) {
+    const size_t idig = n - istart;
+    if (JSOC_UNLIKELY(idig == 0))
+      return idx_number_slow(b, s);
+    if (JSOC_UNLIKELY(b->input[s + istart] == '0' && idig > 1))
+      return idx_number_slow(b, s); /* leading zero */
+    /* Plain integer: enforce the int64/uint64 limits.  19/20 digits are rare
+     * enough to leave to the authoritative validator. */
+    if (JSOC_UNLIKELY(!neg ? idig >= 19 : idig >= 18))
+      return idx_number_slow(b, s);
+  } else {
+    const size_t pd = (size_t)__builtin_ctz(nd);
+    if (JSOC_UNLIKELY(b->input[s + pd] != '.' || pd == istart || pd + 1 >= n))
+      return idx_number_slow(b, s);
+    if (JSOC_UNLIKELY(b->input[s + istart] == '0' && pd - istart > 1))
+      return idx_number_slow(b, s); /* leading zero */
+  }
+  b->pos++;
+  /* At most 32 plain decimal bytes cannot overflow a double. */
+  return idx_scalar(b, JSOC_VALUE_NUMBER, s, (uint32_t)n);
+}
 
 static inline JSOC_ALWAYS_INLINE uint32_t idx_parse_value(idx_builder *b) {
   if (JSOC_UNLIKELY(b->pos >= b->count)) {
