@@ -160,6 +160,405 @@ static inline JSOC_ALWAYS_INLINE uint32_t dom_build_value(dom_builder *b) {
   return JSOC_NO_INDEX;
 }
 
+/* ------------------------------------------------------------------------- */
+/* Index-driven builder (split DOM path)                                      */
+/* ------------------------------------------------------------------------- */
+
+#if JSOC_SIMD_AVX2
+/* `jsoc_dom_stage1` already validated UTF-8 and string escapes, so this pass
+ * only has to walk the structural indexes, check the grammar, validate number
+ * ranges and materialise the tree.  Any anomaly aborts and makes `jsoc_parse`
+ * replay the ordinary tokenizer, which reports the exact error and partial
+ * token stream; that keeps malformed input semantics untouched. */
+typedef struct {
+  const char *input;
+  size_t length;
+  const uint32_t *indexes;
+  size_t count;
+  size_t pos;
+  jsoc_document *doc;
+  uint32_t next_value;
+  uint32_t next_member;
+  size_t value_cap;
+  size_t member_cap;
+  unsigned depth;
+  bool fail;
+} idx_builder;
+
+static uint32_t idx_parse_value(idx_builder *b);
+static uint32_t idx_parse_array(idx_builder *b);
+static uint32_t idx_parse_object(idx_builder *b);
+
+static inline JSOC_ALWAYS_INLINE uint32_t
+idx_scalar(idx_builder *b, jsoc_value_type type, uint32_t offset,
+           uint32_t length) {
+  if (JSOC_UNLIKELY(b->next_value >= b->value_cap)) {
+    b->fail = true;
+    return JSOC_NO_INDEX;
+  }
+  const uint32_t index = b->next_value++;
+  jsoc_value *v = &b->doc->values[index];
+  v->offset = offset;
+  v->length = length;
+  v->next = JSOC_NO_INDEX;
+  v->type = (uint8_t)type;
+  v->flags = 0;
+  v->reserved = 0;
+  return index;
+}
+
+static inline JSOC_ALWAYS_INLINE bool idx_scalar_end(const idx_builder *b,
+                                                     size_t end) {
+  if (end >= b->length)
+    return true;
+  const unsigned char c = (unsigned char)b->input[end];
+  return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == ',' ||
+         c == '}' || c == ']';
+}
+
+/* The next index after an opening quote is necessarily the closing quote:
+ * stage 1 emits no starts for string contents, and escaped quotes are
+ * excluded from the quote mask. */
+static inline JSOC_ALWAYS_INLINE bool
+idx_string(idx_builder *b, uint32_t *offset, uint32_t *length) {
+  const size_t p = b->pos;
+  if (JSOC_UNLIKELY(p + 1 >= b->count))
+    return false;
+  const uint32_t open = b->indexes[p];
+  const uint32_t close = b->indexes[p + 1];
+  if (JSOC_UNLIKELY(b->input[open] != '"' || b->input[close] != '"' ||
+                    close <= open)) {
+    return false;
+  }
+  *offset = open + 1;
+  *length = close - open - 1;
+  b->pos = p + 2;
+  return true;
+}
+
+static uint32_t idx_literal(idx_builder *b) {
+  const uint32_t s = b->indexes[b->pos];
+  const unsigned char c = (unsigned char)b->input[s];
+  const char *lit = (c == 't') ? "true" : ((c == 'f') ? "false" : "null");
+  const size_t litlen = (c == 'f') ? 5 : 4;
+  const jsoc_value_type type = (c == 't')   ? JSOC_VALUE_TRUE
+                               : (c == 'f') ? JSOC_VALUE_FALSE
+                                            : JSOC_VALUE_NULL;
+  if (JSOC_UNLIKELY(s + litlen > b->length ||
+                    memcmp(b->input + s, lit, litlen) != 0 ||
+                    !idx_scalar_end(b, s + litlen))) {
+    b->fail = true;
+    return JSOC_NO_INDEX;
+  }
+  b->pos++;
+  return idx_scalar(b, type, s, (uint32_t)litlen);
+}
+
+#ifdef JSOC_EXP_S2_FASTNUM
+static uint32_t idx_number(idx_builder *b) {
+  const uint32_t s = b->indexes[b->pos];
+  size_t end = (b->pos + 1 < b->count) ? b->indexes[b->pos + 1] : b->length;
+  while (end > s) {
+    const unsigned char c = (unsigned char)b->input[end - 1];
+    if (c != ' ' && c != '\t' && c != '\n' && c != '\r')
+      break;
+    end--;
+  }
+  b->pos++;
+  return idx_scalar(b, JSOC_VALUE_NUMBER, s, (uint32_t)(end - s));
+}
+#else
+static uint32_t idx_number(idx_builder *b) {
+  const uint32_t s = b->indexes[b->pos];
+  size_t end = 0;
+  size_t err_off = 0;
+  bool out_of_range = false;
+  const jsoc_error_code ec =
+      jsoc_validate_number_checked(b->input, b->length, s, b->doc->arena, &end, &err_off,
+                           &out_of_range);
+  /* Out-of-range numbers take the slow path so the existing overflow/trailing
+   * document scoping logic stays authoritative. */
+  if (JSOC_UNLIKELY(ec != JSOC_OK || out_of_range ||
+                    !idx_scalar_end(b, end))) {
+    b->fail = true;
+    return JSOC_NO_INDEX;
+  }
+  b->pos++;
+  return idx_scalar(b, JSOC_VALUE_NUMBER, s, (uint32_t)(end - s));
+}
+#endif
+
+static inline JSOC_ALWAYS_INLINE uint32_t idx_parse_value(idx_builder *b) {
+  if (JSOC_UNLIKELY(b->pos >= b->count)) {
+    b->fail = true;
+    return JSOC_NO_INDEX;
+  }
+  const unsigned char c = (unsigned char)b->input[b->indexes[b->pos]];
+  if (JSOC_LIKELY(c == '"')) {
+    uint32_t offset;
+    uint32_t length;
+    if (JSOC_UNLIKELY(!idx_string(b, &offset, &length))) {
+      b->fail = true;
+      return JSOC_NO_INDEX;
+    }
+    return idx_scalar(b, JSOC_VALUE_STRING, offset, length);
+  }
+  if (JSOC_LIKELY(c == '{'))
+    return idx_parse_object(b);
+  if (JSOC_LIKELY(c == '['))
+    return idx_parse_array(b);
+  if (c == 't' || c == 'f' || c == 'n')
+    return idx_literal(b);
+  return idx_number(b);
+}
+
+static uint32_t idx_parse_array(idx_builder *b) {
+  if (JSOC_UNLIKELY(b->next_value >= b->value_cap ||
+                    ++b->depth > JSOC_MAX_DEPTH)) {
+    b->fail = true;
+    return JSOC_NO_INDEX;
+  }
+  const uint32_t index = b->next_value++;
+  jsoc_value *v = &b->doc->values[index];
+  v->first = JSOC_NO_INDEX;
+  v->next = JSOC_NO_INDEX;
+  v->count = 0;
+  v->type = (uint8_t)JSOC_VALUE_ARRAY;
+  v->flags = 0;
+  v->reserved = 0;
+
+  b->pos++; /* '[' */
+  if (JSOC_UNLIKELY(b->pos >= b->count)) {
+    b->fail = true;
+    return JSOC_NO_INDEX;
+  }
+  if (b->input[b->indexes[b->pos]] == ']') {
+    b->pos++;
+    b->depth--;
+    return index;
+  }
+
+  uint32_t first = JSOC_NO_INDEX;
+  uint32_t prev = JSOC_NO_INDEX;
+  uint32_t count = 0;
+  for (;;) {
+    const uint32_t child = idx_parse_value(b);
+    if (JSOC_UNLIKELY(child == JSOC_NO_INDEX))
+      return JSOC_NO_INDEX;
+    if (prev == JSOC_NO_INDEX) {
+      first = child;
+    } else {
+      b->doc->values[prev].next = child;
+    }
+    prev = child;
+    count++;
+
+    if (JSOC_UNLIKELY(b->pos >= b->count)) {
+      b->fail = true;
+      return JSOC_NO_INDEX;
+    }
+    const unsigned char c = (unsigned char)b->input[b->indexes[b->pos]];
+    if (c == ',') {
+      b->pos++;
+      continue;
+    }
+    if (JSOC_UNLIKELY(c != ']')) {
+      b->fail = true;
+      return JSOC_NO_INDEX;
+    }
+    b->pos++;
+    break;
+  }
+  b->depth--;
+  v->first = first;
+  v->count = count;
+  return index;
+}
+
+static uint32_t idx_parse_object(idx_builder *b) {
+  if (JSOC_UNLIKELY(b->next_value >= b->value_cap ||
+                    ++b->depth > JSOC_MAX_DEPTH)) {
+    b->fail = true;
+    return JSOC_NO_INDEX;
+  }
+  const uint32_t index = b->next_value++;
+  jsoc_value *v = &b->doc->values[index];
+  v->first = JSOC_NO_INDEX;
+  v->next = JSOC_NO_INDEX;
+  v->count = 0;
+  v->type = (uint8_t)JSOC_VALUE_OBJECT;
+  v->flags = 0;
+  v->reserved = 0;
+
+  b->pos++; /* '{' */
+  if (JSOC_UNLIKELY(b->pos >= b->count)) {
+    b->fail = true;
+    return JSOC_NO_INDEX;
+  }
+  if (b->input[b->indexes[b->pos]] == '}') {
+    b->pos++;
+    b->depth--;
+    return index;
+  }
+
+  uint32_t first = JSOC_NO_INDEX;
+  uint32_t prev = JSOC_NO_INDEX;
+  uint32_t count = 0;
+  for (;;) {
+    if (JSOC_UNLIKELY(b->pos >= b->count ||
+                      b->input[b->indexes[b->pos]] != '"')) {
+      b->fail = true;
+      return JSOC_NO_INDEX;
+    }
+    uint32_t key_offset;
+    uint32_t key_length;
+    if (JSOC_UNLIKELY(!idx_string(b, &key_offset, &key_length))) {
+      b->fail = true;
+      return JSOC_NO_INDEX;
+    }
+    if (JSOC_UNLIKELY(b->pos >= b->count ||
+                      b->input[b->indexes[b->pos]] != ':')) {
+      b->fail = true;
+      return JSOC_NO_INDEX;
+    }
+    b->pos++;
+    const uint32_t child = idx_parse_value(b);
+    if (JSOC_UNLIKELY(child == JSOC_NO_INDEX))
+      return JSOC_NO_INDEX;
+
+    if (JSOC_UNLIKELY(b->next_member >= b->member_cap)) {
+      b->fail = true;
+      return JSOC_NO_INDEX;
+    }
+    const uint32_t m = b->next_member++;
+    jsoc_member *member = &b->doc->members[m];
+    member->key_offset = key_offset;
+    member->key_length = key_length;
+    member->value = child;
+    member->next = JSOC_NO_INDEX;
+    if (prev == JSOC_NO_INDEX) {
+      first = m;
+    } else {
+      b->doc->members[prev].next = m;
+    }
+    prev = m;
+    count++;
+
+    if (JSOC_UNLIKELY(b->pos >= b->count)) {
+      b->fail = true;
+      return JSOC_NO_INDEX;
+    }
+    const unsigned char c = (unsigned char)b->input[b->indexes[b->pos]];
+    if (c == ',') {
+      b->pos++;
+      continue;
+    }
+    if (JSOC_UNLIKELY(c != '}')) {
+      b->fail = true;
+      return JSOC_NO_INDEX;
+    }
+    b->pos++;
+    break;
+  }
+  b->depth--;
+  v->first = first;
+  v->count = count;
+  return index;
+}
+
+/* The split path pays for grammar in stage 2, so it only wins when the input
+ * is structurally dense.  Long-string documents (low punctuation/quote
+ * density) are better served by the fused tokenizer, which does grammar work
+ * the scan is already touching.  Sampling a 4 KiB prefix is enough to tell
+ * them apart and costs a few microseconds. */
+typedef struct {
+  bool worthwhile;
+  bool branchless; /* string-dense: skip the per-block empty-string test */
+} dom_probe;
+
+static dom_probe dom_probe_prefix(const char *input, size_t length) {
+  const size_t limit = length < 4096 ? length : 4096;
+  size_t base = 0;
+  size_t hits = 0;
+  size_t quotes = 0;
+  const uint8_t *p = (const uint8_t *)input;
+  while (base + 64 <= limit) {
+    const jsoc_block_masks m = jsoc_classify64(p + base);
+    hits += (size_t)__builtin_popcountll(m.op | m.quote);
+    quotes += (size_t)__builtin_popcountll(m.quote);
+    base += 64;
+  }
+  for (; base < limit; base++) {
+    const unsigned char c = p[base];
+    if (c == '{' || c == '}' || c == '[' || c == ']' || c == ':' ||
+        c == ',' || c == '"')
+      hits++;
+    if (c == '"')
+      quotes++;
+  }
+  dom_probe probe;
+  /* At least one structural byte per 16 bytes. */
+  probe.worthwhile = hits * 16 >= limit;
+  /* At least one quote per 32 bytes: the input is mostly strings, so paying
+   * the prefix XOR unconditionally beats a per-block branch. */
+  probe.branchless = quotes * 32 >= limit;
+  return probe;
+}
+
+/* Build one document from the index stream.  Returns false without setting a
+ * final error when the input needs the ordinary path. */
+static bool dom_build_indexed(jsoc_document *doc, const uint32_t *indexes,
+                              size_t count, jsoc_arena *arena) {
+#ifdef JSOC_EXP_S2_WALK
+  uint64_t sum = 0;
+  for (size_t i = 0; i < count; i++)
+    sum += (unsigned char)doc->input[indexes[i]];
+  if (sum == 0xFFFFFFFFu)
+    return false;
+  doc->values = NULL;
+  doc->members = NULL;
+  doc->value_count = 0;
+  doc->member_count = 0;
+  doc->root = NULL;
+  return true;
+#else
+  const size_t value_cap = count / 2 + 2;
+  const size_t member_cap = count / 2 + 2;
+
+  doc->values = jsoc_arena_alloc_t(arena, jsoc_value, value_cap);
+  doc->members = jsoc_arena_alloc_t(arena, jsoc_member, member_cap);
+  if (JSOC_UNLIKELY(!doc->values || !doc->members))
+    return false;
+  doc->value_count = value_cap;
+  doc->member_count = member_cap;
+  doc->string_cache = NULL;
+
+  idx_builder b = {
+      .input = doc->input,
+      .length = doc->length,
+      .indexes = indexes,
+      .count = count,
+      .pos = 0,
+      .doc = doc,
+      .next_value = 0,
+      .next_member = 0,
+      .value_cap = value_cap,
+      .member_cap = member_cap,
+      .depth = 0,
+      .fail = false,
+  };
+  const uint32_t root = idx_parse_value(&b);
+  if (JSOC_UNLIKELY(b.fail || root == JSOC_NO_INDEX || b.pos != count))
+    return false;
+
+  doc->value_count = b.next_value;
+  doc->member_count = b.next_member;
+  doc->root = &doc->values[root];
+  return true;
+#endif
+}
+#endif /* JSOC_SIMD_AVX2 */
+
 /* Build one document starting at `start`.  `limit` is the exclusive end of
  * the token stream (the EOF token index).  On success `*out_end` receives the
  * token index one past the document, which lets callers detect concatenated
@@ -469,6 +868,29 @@ JSOC_API jsoc_document jsoc_parse(const char *input, size_t length,
     doc.error = (jsoc_error){JSOC_ERR_INPUT_TOO_LARGE, 0, 1, 1};
     return doc;
   }
+
+#if JSOC_SIMD_AVX2
+  /* Split fast path: stage 1 emits structural indexes (and validates UTF-8 /
+   * string escapes); stage 2 walks them to build the tree.  Anything the fast
+   * path cannot handle replays the ordinary tokenizer so errors stay exact. */
+  const dom_probe probe =
+      (length >= 64) ? dom_probe_prefix(input, length)
+                     : (dom_probe){false, false};
+  if (length >= 64 && probe.worthwhile) {
+    uint32_t *indexes = NULL;
+    size_t index_count = 0;
+    if (jsoc_dom_stage1(input, length, arena, probe.branchless, &indexes,
+                        &index_count)) {
+      doc.input = input;
+      doc.length = length;
+      doc.arena = arena;
+      if (dom_build_indexed(&doc, indexes, index_count, arena))
+        return doc;
+      memset(&doc, 0, sizeof doc);
+      doc.error = (jsoc_error)JSOC_ERR_INIT;
+    }
+  }
+#endif
 
   size_t overflow_token = SIZE_MAX;
   /* Compact mode: separators are validated by the tokenizer but not stored,

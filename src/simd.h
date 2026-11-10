@@ -225,12 +225,9 @@ static inline JSOC_ALWAYS_INLINE uint64_t jsoc_mask64(uint32_t lo, uint32_t hi) 
     return (uint64_t)lo | ((uint64_t)hi << 32);
 }
 
-/* Classify a 64-byte block.  `p` may be unaligned; it must be readable for
- * 64 bytes (the caller copies the final short tail into a padded buffer). */
-static inline JSOC_ALWAYS_INLINE jsoc_block_masks jsoc_classify64(const uint8_t *p) {
-    const __m256i lo = _mm256_loadu_si256((const __m256i *)(const void *)p);
-    const __m256i hi = _mm256_loadu_si256((const __m256i *)(const void *)(p + 32));
-
+/* Classify an already-loaded 64-byte block (two 32-byte halves). */
+static inline JSOC_ALWAYS_INLINE jsoc_block_masks jsoc_classify64_vec(__m256i lo,
+                                                                     __m256i hi) {
     /* Byte values < 0x80 map exactly through a 16-entry low-nibble table.
      * The table stores the byte itself for whitespace, so the compare below
      * is an exact byte match (0x30 etc. do not collide with ' '). */
@@ -279,6 +276,14 @@ static inline JSOC_ALWAYS_INLINE jsoc_block_masks jsoc_classify64(const uint8_t 
     m.nonascii   = (uint64_t)(_mm256_movemask_epi8(
                                     _mm256_or_si256(lo, hi)) != 0);
     return m;
+}
+
+/* Classify a 64-byte block.  `p` may be unaligned; it must be readable for
+ * 64 bytes (the caller copies the final short tail into a padded buffer). */
+static inline JSOC_ALWAYS_INLINE jsoc_block_masks jsoc_classify64(const uint8_t *p) {
+    return jsoc_classify64_vec(
+        _mm256_loadu_si256((const __m256i *)(const void *)p),
+        _mm256_loadu_si256((const __m256i *)(const void *)(p + 32)));
 }
 
 /* Cumulative bitwise XOR: flips every bit from each set bit onward.

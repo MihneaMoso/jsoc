@@ -144,18 +144,9 @@ static inline jsoc_error push_token(tokenizer_t *t, jsoc_token_type type,
 /* Character classes                                                          */
 /* ------------------------------------------------------------------------- */
 
-static inline bool is_digit(unsigned char c) {
-  return (unsigned)(c - '0') < 10u;
-}
-
-static inline bool is_hex_digit(unsigned char c) {
-  return (unsigned)(c - '0') < 10u || (unsigned)(c - 'a') < 6u ||
-         (unsigned)(c - 'A') < 6u;
-}
-
 static inline bool starts_value(unsigned char c) {
   return c == '{' || c == '[' || c == '"' || c == 't' || c == 'f' || c == 'n' ||
-         c == '-' || is_digit(c);
+         c == '-' || jsoc_is_digit(c);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -209,7 +200,7 @@ static jsoc_error parse_string(tokenizer_t *t) {
           return make_error_at(t, JSOC_ERR_INVALID_UNICODE, i);
         }
         for (size_t k = 2; k < 6; k++) {
-          if (JSOC_UNLIKELY(!is_hex_digit((unsigned char)in[i + k]))) {
+          if (JSOC_UNLIKELY(!jsoc_is_hex_digit((unsigned char)in[i + k]))) {
             return make_error_at(t, JSOC_ERR_INVALID_UNICODE, i);
           }
         }
@@ -233,10 +224,6 @@ static jsoc_error parse_string(tokenizer_t *t) {
 static jsoc_error_code validate_number_basic(const char *in, size_t len,
                                              size_t start, size_t *end,
                                              size_t *err_off);
-static inline JSOC_ALWAYS_INLINE jsoc_error_code validate_number_checked(
-    const char *in, size_t len, size_t start, jsoc_arena *arena, size_t *end,
-    size_t *err_off, bool *out_of_range);
-
 static jsoc_error parse_number(tokenizer_t *t) {
   const size_t start = t->pos;
   size_t end = 0;
@@ -244,7 +231,7 @@ static jsoc_error parse_number(tokenizer_t *t) {
   jsoc_error_code ec;
   if (t->check_numbers) {
     bool out_of_range = false;
-    ec = validate_number_checked(t->input, t->length, start, t->arena, &end,
+    ec = jsoc_validate_number_checked(t->input, t->length, start, t->arena, &end,
                                  &err_off, &out_of_range);
     if (JSOC_UNLIKELY(ec == JSOC_OK && out_of_range &&
                       t->overflow_token == SIZE_MAX)) {
@@ -415,7 +402,7 @@ sv_value:
     goto fail;
 
   default:
-    if (is_digit((unsigned char)t.input[t.pos]) || t.input[t.pos] == '-') {
+    if (jsoc_is_digit((unsigned char)t.input[t.pos]) || t.input[t.pos] == '-') {
       err = parse_number(&t);
       if (JSOC_UNLIKELY(err.code != JSOC_OK))
         goto fail;
@@ -605,7 +592,7 @@ static inline JSOC_ALWAYS_INLINE jsoc_error_code validate_number_basic(
   if (in[i] == '-')
     i++;
 
-  if (JSOC_UNLIKELY(i >= len || !is_digit((unsigned char)in[i]))) {
+  if (JSOC_UNLIKELY(i >= len || !jsoc_is_digit((unsigned char)in[i]))) {
     *err_off = i;
     return JSOC_ERR_INVALID_NUMBER;
   }
@@ -613,7 +600,7 @@ static inline JSOC_ALWAYS_INLINE jsoc_error_code validate_number_basic(
   if (in[i] == '0') {
     i++;
     /* JSON forbids leading zeroes (01, -012). */
-    if (JSOC_UNLIKELY(i < len && is_digit((unsigned char)in[i]))) {
+    if (JSOC_UNLIKELY(i < len && jsoc_is_digit((unsigned char)in[i]))) {
       *err_off = i;
       return JSOC_ERR_INVALID_NUMBER;
     }
@@ -644,135 +631,6 @@ static inline JSOC_ALWAYS_INLINE jsoc_error_code validate_number_basic(
   }
 
   *end = i;
-  return JSOC_OK;
-}
-
-/* Checked variant: identical syntax and error offsets, plus a direct
- * representability verdict.  The lexeme shape stays in locals instead of a
- * struct so the DOM's number check does not add stores per number. */
-static inline JSOC_ALWAYS_INLINE jsoc_error_code validate_number_checked(
-    const char *in, size_t len, size_t start, jsoc_arena *arena, size_t *end,
-    size_t *err_off, bool *out_of_range) {
-  size_t i = start;
-  bool negative = false;
-  if (in[i] == '-') {
-    negative = true;
-    i++;
-  }
-
-  if (JSOC_UNLIKELY(i >= len || !is_digit((unsigned char)in[i]))) {
-    *err_off = i;
-    return JSOC_ERR_INVALID_NUMBER;
-  }
-
-  const size_t int_start = i;
-  size_t int_digits;
-  bool int_nonzero;
-  if (in[i] == '0') {
-    int_nonzero = false;
-    int_digits = 1;
-    i++;
-    /* JSON forbids leading zeroes (01, -012). */
-    if (JSOC_UNLIKELY(i < len && is_digit((unsigned char)in[i]))) {
-      *err_off = i;
-      return JSOC_ERR_INVALID_NUMBER;
-    }
-  } else {
-    int_nonzero = true;
-    const size_t run = jsoc_digit_run(in, len, i);
-    int_digits = run;
-    i += run;
-  }
-
-  bool has_fraction = false;
-  size_t frac_start = 0;
-  size_t frac_digits = 0;
-  if (i < len && in[i] == '.') {
-    has_fraction = true;
-    i++;
-    const size_t run = jsoc_digit_run(in, len, i);
-    if (JSOC_UNLIKELY(run == 0)) {
-      *err_off = i;
-      return JSOC_ERR_INVALID_NUMBER;
-    }
-    frac_start = i;
-    frac_digits = run;
-    i += run;
-  }
-
-  bool has_exponent = false;
-  long explicit_exponent = 0;
-  if (i < len && (in[i] == 'e' || in[i] == 'E')) {
-    has_exponent = true;
-    i++;
-    int sign = 1;
-    if (i < len && (in[i] == '+' || in[i] == '-')) {
-      if (in[i] == '-')
-        sign = -1;
-      i++;
-    }
-    const size_t exp_start = i;
-    const size_t run = jsoc_digit_run(in, len, i);
-    if (JSOC_UNLIKELY(run == 0)) {
-      *err_off = i;
-      return JSOC_ERR_INVALID_NUMBER;
-    }
-    long e = 0;
-    for (size_t k = exp_start; k < i + run; k++) {
-      if (e < 100000)
-        e = e * 10 + (in[k] - '0');
-    }
-    explicit_exponent = sign * e;
-    i += run;
-  }
-
-  *end = i;
-
-  /* simdjson-compatible limits: integer lexemes must fit int64/uint64;
-   * fractional/exponent forms must fit a finite double. */
-  bool bad;
-  if (!has_fraction && !has_exponent) {
-    /* JSON forbids leading zeroes, so digit count decides most lexemes. */
-    if (!negative) {
-      bad = int_digits > 20 ||
-            (int_digits == 20 &&
-             memcmp(in + int_start, "18446744073709551615", 20) > 0);
-    } else {
-      bad = int_digits > 19 ||
-            (int_digits == 19 &&
-             memcmp(in + int_start, "9223372036854775808", 19) > 0);
-    }
-  } else {
-    long magnitude;
-    if (int_nonzero) {
-      magnitude = (long)int_digits - 1 + explicit_exponent;
-    } else {
-      /* The integer part is all zero: the first nonzero fraction digit
-       * fixes the exponent. */
-      size_t first_significant = SIZE_MAX;
-      for (size_t j = 0; j < frac_digits; j++) {
-        if (in[frac_start + j] != '0') {
-          first_significant = j;
-          break;
-        }
-      }
-      if (first_significant == SIZE_MAX) {
-        *out_of_range = false; /* zero */
-        return JSOC_OK;
-      }
-      magnitude = -(long)first_significant - 1 + explicit_exponent;
-    }
-    if (magnitude >= 309) {
-      bad = true;
-    } else if (magnitude <= 307) {
-      bad = false;
-    } else {
-      /* 1e308 <= |value| < 1e309: DBL_MAX lives in this band. */
-      bad = !jsoc_lexeme_to_double(arena, in + start, i - start, NULL);
-    }
-  }
-
-  *out_of_range = bad;
   return JSOC_OK;
 }
 
@@ -1128,7 +986,7 @@ fused_check_specials(fused_t *f, size_t base, uint64_t backslash,
         return false;
       }
       for (size_t k = 2; k < 6; k++) {
-        if (JSOC_UNLIKELY(!is_hex_digit((unsigned char)f->input[g + k]))) {
+        if (JSOC_UNLIKELY(!jsoc_is_hex_digit((unsigned char)f->input[g + k]))) {
           f->need_scalar = true;
           f->failed = true;
           return false;
@@ -1368,7 +1226,7 @@ again:
     jsoc_error_code ec;
     if (f->check_numbers) {
       bool out_of_range = false;
-      ec = validate_number_checked(f->input, f->length, s, f->arena, &end,
+      ec = jsoc_validate_number_checked(f->input, f->length, s, f->arena, &end,
                                    &err_off, &out_of_range);
       if (JSOC_UNLIKELY(ec == JSOC_OK && out_of_range &&
                         f->overflow_token == SIZE_MAX)) {
@@ -1529,6 +1387,244 @@ static inline void fused_process_block(fused_t *f, const uint8_t *block,
       return;
     }
   }
+}
+
+/* ------------------------------------------------------------------------- */
+/* DOM fast path: structural index stream                                     */
+/* ------------------------------------------------------------------------- */
+
+/* Stage 1 for the split DOM path.  This is the same block classification and
+ * UTF-8/escape validation as the fused tokenizer, but instead of running the
+ * grammar and materialising 12-byte tokens it appends one 4-byte index per
+ * token start.  Grammar, scalar validation and DOM construction happen in
+ * stage 2.  Any irregularity makes stage 1 return false so the caller can
+ * replay the existing tokenizer and preserve its exact errors. */
+
+typedef struct {
+  jsoc_stage1_state s1;
+  jsoc_utf8_state utf8;
+  size_t esc_skip_until;
+} stage1_t;
+
+/* Length of a JSON escape sequence in bytes, or 0 when the byte after a
+ * backslash is not a legal escape. */
+static const unsigned char jsoc_escape_len[256] = {
+    ['"'] = 2,  ['\\'] = 2, ['/'] = 2,  ['b'] = 2,  ['f'] = 2,
+    ['n'] = 2,  ['r'] = 2,  ['t'] = 2,  ['u'] = 6,
+};
+
+static JSOC_NOINLINE bool stage1_check_specials(const char *input,
+                                                size_t length, size_t base,
+                                                uint64_t backslash,
+                                                uint64_t control,
+                                                uint64_t in_string) {
+  if (JSOC_UNLIKELY((control & in_string) != 0))
+    return false;
+
+  /* `backslash` already excludes chars escaped by an odd backslash run, so
+   * every set bit introduces an escape. */
+  uint64_t bs = backslash & in_string;
+  while (bs != 0) {
+    const unsigned b = (unsigned)__builtin_ctzll(bs);
+    bs &= bs - 1;
+    const size_t g = base + b;
+    const size_t e = g + 1;
+    if (JSOC_UNLIKELY(e >= length))
+      return false;
+    const unsigned char c = (unsigned char)input[e];
+    const unsigned len = jsoc_escape_len[c];
+    if (JSOC_UNLIKELY(len == 0))
+      return false;
+    if (len == 6) {
+      if (JSOC_UNLIKELY(g + 6 > length))
+        return false;
+      for (size_t k = 2; k < 6; k++) {
+        if (JSOC_UNLIKELY(!jsoc_is_hex_digit((unsigned char)input[g + k])))
+          return false;
+      }
+    }
+  }
+  return true;
+}
+
+static inline JSOC_ALWAYS_INLINE bool
+stage1_compute_block(stage1_t *st, const char *input, size_t length,
+                     const uint8_t *block, size_t base, uint64_t valid_mask,
+                     const bool branchless, uint64_t *out_starts) {
+  const __m256i lo = _mm256_loadu_si256((const __m256i *)(const void *)block);
+  const __m256i hi =
+      _mm256_loadu_si256((const __m256i *)(const void *)(block + 32));
+  const jsoc_block_masks m = jsoc_classify64_vec(lo, hi);
+
+#ifndef JSOC_EXP_S1_NO_UTF8
+  if (JSOC_LIKELY((m.quote | st->s1.prev_in_string) != 0)) {
+    if (JSOC_LIKELY(m.nonascii == 0)) {
+      st->utf8.error =
+          _mm256_or_si256(st->utf8.error, st->utf8.prev_incomplete);
+      st->utf8.prev_incomplete = _mm256_setzero_si256();
+      st->utf8.prev_input = _mm256_setzero_si256();
+    } else {
+      jsoc_utf8_check_chunk(&st->utf8, lo);
+      jsoc_utf8_check_chunk(&st->utf8, hi);
+    }
+  }
+#endif
+
+  uint64_t quote;
+  uint64_t in_string;
+  if (!branchless &&
+      JSOC_LIKELY(m.quote == 0 && st->s1.prev_in_string == 0)) {
+    /* No string activity in this block (or carried into it): skip the
+     * prefix XOR.  Wordy inputs take the branch-free path instead. */
+    (void)jsoc_escape_next(m.backslash, &st->s1.next_is_escaped);
+    quote = 0;
+    in_string = 0;
+  } else {
+    const uint64_t escaped =
+        jsoc_escape_next(m.backslash, &st->s1.next_is_escaped);
+    quote = m.quote & ~escaped;
+    in_string = jsoc_prefix_xor(quote) ^ st->s1.prev_in_string;
+    st->s1.prev_in_string = (uint64_t)((int64_t)in_string >> 63);
+
+    if (JSOC_UNLIKELY(((m.backslash | m.control) & in_string & valid_mask) !=
+                      0)) {
+#ifndef JSOC_EXP_S1_NO_SPECIALS
+      if (!stage1_check_specials(input, length, base,
+                                 m.backslash & ~escaped & valid_mask,
+                                 m.control & valid_mask, in_string)) {
+        return false;
+      }
+#endif
+    }
+  }
+
+  const uint64_t string_tail = in_string ^ quote;
+  const uint64_t scalar = ~(m.op | m.whitespace);
+  const uint64_t nonquote_scalar = scalar & ~quote;
+  const uint64_t follows = (nonquote_scalar << 1) | st->s1.prev_scalar;
+  st->s1.prev_scalar = nonquote_scalar >> 63;
+
+  uint64_t starts =
+      ((m.op | (scalar & ~follows)) & ~string_tail) | (quote & ~in_string);
+  *out_starts = starts & valid_mask;
+  return true;
+}
+
+/* Emit the indexes for one block.  Kept separate from the scan so the caller
+ * can write the previous block's indexes while the current block is being
+ * classified (the same pipelining simdjson uses). */
+static inline JSOC_ALWAYS_INLINE void
+stage1_write_indexes(uint32_t *out, size_t *count, uint64_t starts,
+                     size_t base) {
+#ifdef JSOC_EXP_S1_NO_WRITE
+  (void)out; (void)base;
+  if (starts != 0) *count += (size_t)__builtin_popcountll(starts);
+  return;
+#endif
+  if (JSOC_UNLIKELY(starts == 0))
+    return;
+  size_t n = *count;
+  /* Unroll in groups of four: most blocks contain only a handful of starts,
+   * and this hides the ctz/clear dependency chain. */
+  unsigned remaining = (unsigned)__builtin_popcountll(starts);
+  while (remaining >= 4) {
+    out[n + 0] = (uint32_t)(base + (unsigned)__builtin_ctzll(starts));
+    starts &= starts - 1;
+    out[n + 1] = (uint32_t)(base + (unsigned)__builtin_ctzll(starts));
+    starts &= starts - 1;
+    out[n + 2] = (uint32_t)(base + (unsigned)__builtin_ctzll(starts));
+    starts &= starts - 1;
+    out[n + 3] = (uint32_t)(base + (unsigned)__builtin_ctzll(starts));
+    starts &= starts - 1;
+    n += 4;
+    remaining -= 4;
+  }
+  while (remaining-- != 0) {
+    out[n++] = (uint32_t)(base + (unsigned)__builtin_ctzll(starts));
+    starts &= starts - 1;
+  }
+  *count = n;
+}
+
+static inline JSOC_ALWAYS_INLINE bool
+stage1_scan(const char *input, size_t length, uint32_t *indexes,
+            const bool branchless, size_t *out_count) {
+  stage1_t st;
+  memset(&st, 0, sizeof st);
+  jsoc_utf8_state_init(&st.utf8);
+
+  const uint8_t *p = (const uint8_t *)input;
+  size_t base = 0;
+  size_t count = 0;
+
+  /* Delay each block's index write by one iteration so it overlaps the next
+   * block's classification. */
+  uint64_t held_starts = 0;
+  size_t held_base = 0;
+  bool have_held = false;
+
+  while (base + 64 <= length) {
+    uint64_t starts;
+    if (JSOC_UNLIKELY(!stage1_compute_block(&st, input, length, p + base, base,
+                                            ~(uint64_t)0, branchless,
+                                            &starts))) {
+      return false;
+    }
+    if (have_held)
+      stage1_write_indexes(indexes, &count, held_starts, held_base);
+    held_starts = starts;
+    held_base = base;
+    have_held = true;
+    base += 64;
+  }
+
+  if (base < length) {
+    alignas(64) uint8_t block[64];
+    const size_t rem = length - base;
+    memset(block, ' ', sizeof block);
+    memcpy(block, p + base, rem);
+    const uint64_t valid = ((uint64_t)1 << rem) - 1;
+    uint64_t starts;
+    if (JSOC_UNLIKELY(!stage1_compute_block(&st, input, length, block, base,
+                                            valid, branchless, &starts))) {
+      return false;
+    }
+    if (have_held)
+      stage1_write_indexes(indexes, &count, held_starts, held_base);
+    held_starts = starts;
+    held_base = base;
+    have_held = true;
+  }
+  if (have_held)
+    stage1_write_indexes(indexes, &count, held_starts, held_base);
+
+  st.utf8.error = _mm256_or_si256(st.utf8.error, st.utf8.prev_incomplete);
+  if (JSOC_UNLIKELY(!_mm256_testz_si256(st.utf8.error, st.utf8.error)))
+    return false;
+
+  *out_count = count;
+  return true;
+}
+
+JSOC_INTERNAL bool jsoc_dom_stage1(const char *input, size_t length,
+                                   jsoc_arena *arena, bool branchless,
+                                   uint32_t **out_indexes, size_t *out_count) {
+  uint32_t *indexes = jsoc_arena_alloc(
+      arena, (length + 64) * sizeof(uint32_t), _Alignof(uint32_t));
+  if (JSOC_UNLIKELY(!indexes))
+    return false;
+
+  /* `branchless` is a literal at each call so the string-scan branch is
+   * compiled out on the wordy path. */
+  if (branchless) {
+    if (!stage1_scan(input, length, indexes, true, out_count))
+      return false;
+  } else {
+    if (!stage1_scan(input, length, indexes, false, out_count))
+      return false;
+  }
+  *out_indexes = indexes;
+  return true;
 }
 
 static inline JSOC_ALWAYS_INLINE jsoc_result
@@ -1740,6 +1836,18 @@ jsoc_tokenize_simd_stream_compact_impl(const char *input, size_t length,
                                        jsoc_arena *arena,
                                        size_t *overflow_token) {
   return tokenize_scalar(input, length, arena, overflow_token, true, true);
+}
+
+JSOC_INTERNAL bool jsoc_dom_stage1(const char *input, size_t length,
+                                   jsoc_arena *arena, bool branchless,
+                                   uint32_t **out_indexes, size_t *out_count) {
+  (void)input;
+  (void)length;
+  (void)arena;
+  (void)branchless;
+  (void)out_indexes;
+  (void)out_count;
+  return false;
 }
 #endif
 

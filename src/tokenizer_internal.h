@@ -80,6 +80,14 @@ JSOC_INTERNAL jsoc_result jsoc_tokenize_compact_utf8(const char *input,
                                                      jsoc_arena *arena,
                                                      size_t *overflow_token);
 
+/* Split DOM path, stage 1: append one 4-byte structural index per token start.
+ * Returns false on any irregularity (invalid UTF-8, bad escape/control byte,
+ * allocation failure), in which case the caller must use the ordinary
+ * tokenizer so the exact error is reported. */
+JSOC_INTERNAL bool jsoc_dom_stage1(const char *input, size_t length,
+                                   jsoc_arena *arena, bool branchless,
+                                   uint32_t **out_indexes, size_t *out_count);
+
 /* True when this build contains the AVX2 stage-1 tokenizer. */
 JSOC_INTERNAL bool jsoc_tokenizer_simd_available(void);
 
