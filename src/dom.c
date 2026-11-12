@@ -177,6 +177,8 @@ typedef struct {
   size_t count;
   size_t pos;
   jsoc_document *doc;
+  jsoc_value *values;
+  jsoc_member *members;
   uint32_t next_value;
   uint32_t next_member;
   size_t value_cap;
@@ -197,12 +199,14 @@ idx_scalar(idx_builder *b, jsoc_value_type type, uint32_t offset,
     return JSOC_NO_INDEX;
   }
   const uint32_t index = b->next_value++;
-  jsoc_value *v = &b->doc->values[index];
-  v->offset = offset;
-  v->length = length;
-  v->next = JSOC_NO_INDEX;
-  const uint32_t tail = (uint32_t)(uint8_t)type; /* flags and reserved are 0 */
-  memcpy((unsigned char *)v + 12, &tail, sizeof tail);
+  jsoc_value *v = &b->values[index];
+  /* offset/length and next/type/flags/reserved are two naturally aligned
+   * 8-byte groups: two stores instead of four. */
+  const uint64_t head = (uint64_t)offset | ((uint64_t)length << 32);
+  const uint64_t tail =
+      (uint64_t)JSOC_NO_INDEX | ((uint64_t)(uint8_t)type << 32);
+  memcpy((unsigned char *)v, &head, sizeof head);
+  memcpy((unsigned char *)v + 8, &tail, sizeof tail);
   return index;
 }
 
@@ -480,11 +484,10 @@ static uint32_t idx_parse_object(idx_builder *b) {
       return JSOC_NO_INDEX;
     }
     const uint32_t m = b->next_member++;
-    jsoc_member *member = &b->doc->members[m];
-    member->key_offset = key_offset;
-    member->key_length = key_length;
-    member->value = child;
-    member->next = JSOC_NO_INDEX;
+    jsoc_member *member = &b->members[m];
+    _mm_storeu_si128((__m128i *)(void *)member,
+                     _mm_set_epi32((int)JSOC_NO_INDEX, (int)child,
+                                   (int)key_length, (int)key_offset));
     if (prev == JSOC_NO_INDEX) {
       first = m;
     } else {
@@ -597,6 +600,8 @@ static bool dom_build_indexed(jsoc_document *doc, const uint32_t *indexes,
       .input = doc->input,
       .length = doc->length,
       .indexes = indexes,
+      .values = doc->values,
+      .members = doc->members,
       .count = count,
       .pos = 0,
       .doc = doc,
