@@ -70,7 +70,7 @@ TARGETS = $(STATIC_LIB) $(SHARED_LIB) $(TEST_BIN) $(DOM_TEST_BIN) \
 BENCH_ARGS ?= /tmp/opencode/bench_compact.json /tmp/opencode/bench_pretty.json
 
 # Conformance corpora.  Fetch them once with `make fetch-testdata`.
-TEST_DATA ?= /tmp/opencode/simdjson-data
+TEST_DATA ?= ~/simdjson-data
 FUZZ_ITERS ?= 2000
 FUZZ_TARGET ?= all
 FUZZ_SEED ?= 1

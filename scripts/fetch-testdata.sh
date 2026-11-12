@@ -6,10 +6,10 @@
 #   jsonexamples/    from simdjson-data (24 MB): real-world documents
 #   JSONTestSuite/   test_parsing + test_parse_should_be_fast (1 MB)
 #
-# Run once; keep the results in JSOC_TEST_DATA (default /tmp/opencode/simdjson-data).
+# Run once; keep the results in JSOC_TEST_DATA (default ~/simdjson-data).
 set -euo pipefail
 
-dir="${JSOC_TEST_DATA:-/tmp/opencode/simdjson-data}"
+dir="${JSOC_TEST_DATA:-$HOME/simdjson-data}"
 mkdir -p "$(dirname "$dir")"
 
 if [[ ! -f "$dir/jsonchecker/fail01.json" ]] || [[ ! -f "$dir/jsonexamples/twitter.json" ]]; then
