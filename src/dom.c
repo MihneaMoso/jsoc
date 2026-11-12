@@ -937,11 +937,14 @@ JSOC_API jsoc_document jsoc_parse(const char *input, size_t length,
 #if JSOC_SIMD_AVX2
   /* Split fast path: stage 1 emits structural indexes (and validates UTF-8 /
    * string escapes); stage 2 walks them to build the tree.  Anything the fast
-   * path cannot handle replays the ordinary tokenizer so errors stay exact. */
+   * path cannot handle replays the ordinary tokenizer so errors stay exact.
+   * For small documents (64..1023 bytes) the probe's fixed cost is a large
+   * fraction of the parse; the split indexer already beats the fused tokenizer
+   * there, so we force it on with branchless mode (string-heavy heuristic). */
   const dom_probe probe =
-      (length >= 64) ? dom_probe_prefix(input, length)
-                     : (dom_probe){false, false};
-  if (length >= 64 && probe.worthwhile) {
+      (length >= 1024) ? dom_probe_prefix(input, length)
+                       : (dom_probe){length >= 64, true};
+  if (probe.worthwhile) {
     uint32_t *indexes = NULL;
     size_t index_count = 0;
     if (jsoc_dom_stage1(input, length, arena, probe.branchless, &indexes,
