@@ -201,19 +201,21 @@ idx_scalar(idx_builder *b, jsoc_value_type type, uint32_t offset,
   v->offset = offset;
   v->length = length;
   v->next = JSOC_NO_INDEX;
-  v->type = (uint8_t)type;
-  v->flags = 0;
-  v->reserved = 0;
+  const uint32_t tail = (uint32_t)(uint8_t)type; /* flags and reserved are 0 */
+  memcpy((unsigned char *)v + 12, &tail, sizeof tail);
   return index;
 }
 
+/* Characters that may legally follow a literal/number lexeme. */
+static const unsigned char jsoc_scalar_end_char[256] = {
+    [' '] = 1, ['\t'] = 1, ['\n'] = 1, ['\r'] = 1,
+    [','] = 1, ['}'] = 1, [']'] = 1,
+};
+
 static inline JSOC_ALWAYS_INLINE bool idx_scalar_end(const idx_builder *b,
                                                      size_t end) {
-  if (end >= b->length)
-    return true;
-  const unsigned char c = (unsigned char)b->input[end];
-  return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == ',' ||
-         c == '}' || c == ']';
+  return end >= b->length ||
+         jsoc_scalar_end_char[(unsigned char)b->input[end]] != 0;
 }
 
 /* The next index after an opening quote is necessarily the closing quote:
@@ -236,7 +238,8 @@ idx_string(idx_builder *b, uint32_t *offset, uint32_t *length) {
   return true;
 }
 
-static uint32_t idx_literal(idx_builder *b, unsigned char c) {
+static inline JSOC_ALWAYS_INLINE uint32_t
+idx_literal(idx_builder *b, unsigned char c) {
   const uint32_t s = b->indexes[b->pos];
   const char *lit = (c == 't') ? "true" : ((c == 'f') ? "false" : "null");
   const size_t litlen = (c == 'f') ? 5 : 4;
@@ -278,74 +281,56 @@ idx_number_slow(idx_builder *b, uint32_t s) {
 
 static inline JSOC_ALWAYS_INLINE uint32_t idx_number(idx_builder *b) {
   const uint32_t s = b->indexes[b->pos];
-  size_t e = (b->pos + 1 < b->count) ? b->indexes[b->pos + 1] : b->length;
-  while (e > s) {
-    const unsigned char c = (unsigned char)b->input[e - 1];
-    if (c != ' ' && c != '\t' && c != '\n' && c != '\r')
-      break;
-    e--;
-  }
-  const size_t n = e - s;
-  if (JSOC_UNLIKELY(n == 0 || n > 32 || (size_t)s + 32 > b->length))
+  if (JSOC_UNLIKELY((size_t)s + 32 > b->length))
     return idx_number_slow(b, s);
 
-  const __m128i zero = _mm_setzero_si128();
-  const __m128i nine = _mm_set1_epi8(9);
-  const __m128i ch0 = _mm_set1_epi8('0');
-  const __m128i v0 = _mm_loadu_si128((const __m128i *)(const void *)(b->input + s));
-  uint32_t dig = (uint32_t)_mm_movemask_epi8(
-                     _mm_cmpeq_epi8(_mm_subs_epu8(_mm_sub_epi8(v0, ch0), nine), zero)) &
-                 ((n >= 16) ? 0xFFFFu : ((1u << n) - 1u));
-  uint32_t full = (n >= 16) ? 0xFFFFu : ((1u << n) - 1u);
-  if (n > 16) {
-    const __m128i v1 =
-        _mm_loadu_si128((const __m128i *)(const void *)(b->input + s + 16));
-    const uint32_t him = (1u << (n - 16)) - 1u;
-    dig |= ((uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(
-                _mm_subs_epu8(_mm_sub_epi8(v1, ch0), nine), zero)) & him)
-           << 16;
-    full |= him << 16;
-  }
+  /* Classify 32 bytes as digits once and derive the lexeme length from the
+   * masks themselves: an optional '-', a run of digits, and an optional
+   * '.' followed by a run of digits.  This removes the load of the next
+   * token's index and the backward whitespace trim, both of which dominated
+   * pretty-printed input, while keeping exactly the same accepted set. */
+  const __m256i v =
+      _mm256_loadu_si256((const __m256i *)(const void *)(b->input + s));
+  const __m256i zero = _mm256_setzero_si256();
+  const __m256i nine = _mm256_set1_epi8(9);
+  const __m256i ch0 = _mm256_set1_epi8('0');
+  const uint32_t dig = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(
+      _mm256_subs_epu8(_mm256_sub_epi8(v, ch0), nine), zero));
 
-  /* Plain unsigned integers are by far the commonest lexeme (ids, counts):
-   * one compare proves there is nothing else in the token, and 18 digits are
-   * always inside uint64. */
-  if (JSOC_LIKELY(dig == full)) {
-    if (JSOC_UNLIKELY(n > 18 || (n > 1 && b->input[s] == '0')))
-      return idx_number_slow(b, s);
-    b->pos++;
-    return idx_scalar(b, JSOC_VALUE_NUMBER, s, (uint32_t)n);
-  }
-
-  /* Non-digit bytes: exactly the optional leading '-', and at most one '.'. */
-  uint32_t nd = ~dig & full;
-  const bool neg = b->input[s] == '-';
-  if (neg)
-    nd &= ~1u;
-  if (JSOC_UNLIKELY(nd & (nd - 1u))) /* two dots, an exponent, or junk */
+  const uint32_t istart = (b->input[s] == '-') ? 1u : 0u;
+  const uint32_t dm = dig >> istart;
+  if (JSOC_UNLIKELY(dm == 0xFFFFFFFFu)) /* 32+ digits */
+    return idx_number_slow(b, s);
+  const uint32_t i = (uint32_t)__builtin_ctz(~dm); /* integer-part digits */
+  if (JSOC_UNLIKELY(i == 0))
     return idx_number_slow(b, s);
 
-  const size_t istart = neg ? 1u : 0u;
-  if (nd == 0) {
-    const size_t idig = n - istart;
-    if (JSOC_UNLIKELY(idig == 0))
+  uint32_t end = istart + i;
+  uint32_t frac = 0;
+  if (JSOC_UNLIKELY(b->input[s + end] == '.')) {
+    const uint32_t fm = (end + 1 < 32) ? (dig >> (end + 1)) : 0xFFFFFFFFu;
+    if (JSOC_UNLIKELY(fm == 0xFFFFFFFFu))
       return idx_number_slow(b, s);
-    if (JSOC_UNLIKELY(b->input[s + istart] == '0' && idig > 1))
-      return idx_number_slow(b, s); /* leading zero */
-    /* Plain integer: enforce the int64/uint64 limits.  19/20 digits are rare
-     * enough to leave to the authoritative validator. */
-    if (JSOC_UNLIKELY(!neg ? idig >= 19 : idig >= 18))
+    frac = (uint32_t)__builtin_ctz(~fm);
+    if (JSOC_UNLIKELY(frac == 0)) /* '.' with no digit after it */
       return idx_number_slow(b, s);
-  } else {
-    const size_t pd = (size_t)__builtin_ctz(nd);
-    if (JSOC_UNLIKELY(b->input[s + pd] != '.' || pd == istart || pd + 1 >= n))
+    end += 1 + frac;
+  }
+
+  /* The lexeme must end at a byte that can legally follow a scalar; this
+   * routes exponents, junk and malformed numbers to the validator. */
+  if (JSOC_UNLIKELY(!idx_scalar_end(b, (size_t)s + end)))
+    return idx_number_slow(b, s);
+  if (JSOC_UNLIKELY(b->input[s + istart] == '0' && i > 1))
+    return idx_number_slow(b, s); /* leading zero */
+
+  if (JSOC_LIKELY(frac == 0)) {
+    /* Plain integer: enforce the int64/uint64 limits. */
+    if (JSOC_UNLIKELY(istart ? i >= 18 : i >= 19))
       return idx_number_slow(b, s);
-    if (JSOC_UNLIKELY(b->input[s + istart] == '0' && pd - istart > 1))
-      return idx_number_slow(b, s); /* leading zero */
   }
   b->pos++;
-  /* At most 32 plain decimal bytes cannot overflow a double. */
-  return idx_scalar(b, JSOC_VALUE_NUMBER, s, (uint32_t)n);
+  return idx_scalar(b, JSOC_VALUE_NUMBER, s, end);
 }
 
 static inline JSOC_ALWAYS_INLINE uint32_t idx_parse_value(idx_builder *b) {
@@ -354,6 +339,12 @@ static inline JSOC_ALWAYS_INLINE uint32_t idx_parse_value(idx_builder *b) {
     return JSOC_NO_INDEX;
   }
   const unsigned char c = (unsigned char)b->input[b->indexes[b->pos]];
+  /* Numbers are the commonest value in data-heavy documents; check them
+   * before the string/container tests so they take a single predictable
+   * branch.  Anything that is not a number falls through to the original
+   * order, and unknown bytes still reach idx_number's slow validator. */
+  if (JSOC_LIKELY((unsigned)(c - '0') <= 9u || c == '-'))
+    return idx_number(b);
   if (JSOC_LIKELY(c == '"')) {
     uint32_t offset;
     uint32_t length;
@@ -383,9 +374,8 @@ static uint32_t idx_parse_array(idx_builder *b) {
   v->first = JSOC_NO_INDEX;
   v->next = JSOC_NO_INDEX;
   v->count = 0;
-  v->type = (uint8_t)JSOC_VALUE_ARRAY;
-  v->flags = 0;
-  v->reserved = 0;
+  const uint32_t tail = (uint32_t)JSOC_VALUE_ARRAY;
+  memcpy((unsigned char *)v + 12, &tail, sizeof tail);
 
   b->pos++; /* '[' */
   if (JSOC_UNLIKELY(b->pos >= b->count)) {
@@ -446,9 +436,8 @@ static uint32_t idx_parse_object(idx_builder *b) {
   v->first = JSOC_NO_INDEX;
   v->next = JSOC_NO_INDEX;
   v->count = 0;
-  v->type = (uint8_t)JSOC_VALUE_OBJECT;
-  v->flags = 0;
-  v->reserved = 0;
+  const uint32_t tail = (uint32_t)JSOC_VALUE_OBJECT;
+  memcpy((unsigned char *)v + 12, &tail, sizeof tail);
 
   b->pos++; /* '{' */
   if (JSOC_UNLIKELY(b->pos >= b->count)) {
@@ -537,7 +526,18 @@ typedef struct {
 } dom_probe;
 
 static dom_probe dom_probe_prefix(const char *input, size_t length) {
-  const size_t limit = length < 4096 ? length : 4096;
+  /* Sample at most 1/32 of the input (bounded to 256..4096 bytes).  The
+   * probe only estimates structural/quote density, so for small documents a
+   * smaller sample keeps the fixed overhead proportional to the parse; on
+   * every corpus document it yields the same split/branchless decision. */
+  size_t limit = length / 32;
+  if (limit < 256)
+    limit = 256;
+  if (limit > 4096)
+    limit = 4096;
+  /* Never sample past the input: short documents are read exactly. */
+  if (limit > length)
+    limit = length;
   size_t base = 0;
   size_t hits = 0;
   size_t quotes = 0;
@@ -558,10 +558,10 @@ static dom_probe dom_probe_prefix(const char *input, size_t length) {
   }
   dom_probe probe;
   /* At least one structural byte per 16 bytes. */
-  probe.worthwhile = hits * 16 >= limit;
+  probe.worthwhile = hits * 32 >= limit;
   /* At least one quote per 32 bytes: the input is mostly strings, so paying
    * the prefix XOR unconditionally beats a per-block branch. */
-  probe.branchless = quotes * 32 >= limit;
+  probe.branchless = quotes * 48 >= limit;
   return probe;
 }
 

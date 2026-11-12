@@ -1413,8 +1413,25 @@ static const unsigned char jsoc_escape_len[256] = {
     ['n'] = 2,  ['r'] = 2,  ['t'] = 2,  ['u'] = 6,
 };
 
+/* Nibble classifiers for the escape fast path.  A byte belongs to a class iff
+ * `class_lut[low_nibble] & (1 << high_nibble)` is non-zero.  High nibbles
+ * above 7 map to zero, so non-ASCII bytes are never accepted. */
+static const unsigned char jsoc_escape_nibble[16] = {
+    [2] = 0xC4, [4] = 0x80, [5] = 0x80, [6] = 0x40,
+    [12] = 0x20, [14] = 0x40, [15] = 0x04,
+};
+static const unsigned char jsoc_hex_nibble[16] = {
+    [0] = 0x08, [1] = 0x58, [2] = 0x58, [3] = 0x58, [4] = 0x58,
+    [5] = 0x58, [6] = 0x58, [7] = 0x08, [8] = 0x08, [9] = 0x08,
+};
+static const unsigned char jsoc_high_bit[16] = {
+    1, 2, 4, 8, 16, 32, 64, 128, 0, 0, 0, 0, 0, 0, 0, 0,
+};
+
 static JSOC_NOINLINE bool stage1_check_specials(const char *input,
-                                                size_t length, size_t base,
+                                                size_t length,
+                                                const uint8_t *block,
+                                                size_t base,
                                                 uint64_t backslash,
                                                 uint64_t control,
                                                 uint64_t in_string) {
@@ -1424,9 +1441,103 @@ static JSOC_NOINLINE bool stage1_check_specials(const char *input,
   /* `backslash` already excludes chars escaped by an odd backslash run, so
    * every set bit introduces an escape. */
   uint64_t bs = backslash & in_string;
-  while (bs != 0) {
-    const unsigned b = (unsigned)__builtin_ctzll(bs);
-    bs &= bs - 1;
+  if (bs == 0)
+    return true;
+
+  const size_t rem = (length - base < 64) ? length - base : 64;
+  if (rem < 64)
+    bs &= ((uint64_t)1 << rem) - 1;
+
+  /* Sparse escapes are cheaper with the serial loop: the vector classifier
+   * costs about as much as three or four scalar escapes, and most documents
+   * have at most one or two per block.  Dense escape blocks (synthetic
+   * `\uXXXX` corpora) go through the vector path below. */
+  if (JSOC_LIKELY(__builtin_popcountll(bs) <= 2) || rem < 6) {
+    while (bs != 0) {
+      const unsigned b = (unsigned)__builtin_ctzll(bs);
+      bs &= bs - 1;
+      const size_t g = base + b;
+      const size_t e = g + 1;
+      if (JSOC_UNLIKELY(e >= length))
+        return false;
+      const unsigned char c = (unsigned char)input[e];
+      const unsigned len = jsoc_escape_len[c];
+      if (JSOC_UNLIKELY(len == 0))
+        return false;
+      if (len == 6) {
+        if (JSOC_UNLIKELY(g + 6 > length))
+          return false;
+        for (size_t k = 2; k < 6; k++) {
+          if (JSOC_UNLIKELY(!jsoc_is_hex_digit((unsigned char)input[g + k])))
+            return false;
+        }
+      }
+    }
+    return true;
+  }
+
+  /* Classify all 64 bytes once.  The escape path is hot only on synthetically
+   * escaped documents; once it is entered, doing every per-byte test with
+   * three shuffles is much cheaper than a serial bit loop, especially for
+   * `\uXXXX`, which has four hex digits to check per escape. */
+  const __m256i nib = _mm256_set1_epi8(0x0F);
+  const __m256i zero = _mm256_setzero_si256();
+  const __m256i uchr = _mm256_set1_epi8('u');
+  const __m256i esc_lut = _mm256_broadcastsi128_si256(
+      _mm_loadu_si128((const __m128i *)(const void *)jsoc_escape_nibble));
+  const __m256i hex_lut = _mm256_broadcastsi128_si256(
+      _mm_loadu_si128((const __m128i *)(const void *)jsoc_hex_nibble));
+  const __m256i high_bit = _mm256_broadcastsi128_si256(
+      _mm_loadu_si128((const __m128i *)(const void *)jsoc_high_bit));
+
+  uint64_t u_at = 0;
+  uint64_t hex = 0;
+  uint64_t esc = 0;
+  for (int half = 0; half < 2; half++) {
+    const __m256i v = _mm256_loadu_si256(
+        (const __m256i *)(const void *)(block + (size_t)half * 32));
+    const __m256i lo = _mm256_and_si256(v, nib);
+    const __m256i hi = _mm256_and_si256(_mm256_srli_epi16(v, 4), nib);
+    const __m256i bits = _mm256_shuffle_epi8(high_bit, hi);
+    const uint32_t bad_esc = (uint32_t)_mm256_movemask_epi8(
+        _mm256_cmpeq_epi8(_mm256_and_si256(_mm256_shuffle_epi8(esc_lut, lo),
+                                           bits),
+                          zero));
+    const uint32_t bad_hex = (uint32_t)_mm256_movemask_epi8(
+        _mm256_cmpeq_epi8(_mm256_and_si256(_mm256_shuffle_epi8(hex_lut, lo),
+                                           bits),
+                          zero));
+    const uint32_t is_u =
+        (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, uchr));
+    esc |= (uint64_t)(~bad_esc) << (half * 32);
+    hex |= (uint64_t)(~bad_hex) << (half * 32);
+    u_at |= (uint64_t)is_u << (half * 32);
+  }
+
+  /* `safe2`: the next byte is inside this block.  `safe6`: the four bytes
+   * after `\u` are inside this block too. */
+  const uint64_t safe2 = ((uint64_t)1 << (rem - 1)) - 1;
+  const uint64_t safe6 =
+      (rem >= 6) ? (((uint64_t)1 << (rem - 5)) - 1) : 0;
+
+  /* Plain escapes: the byte after the backslash must be a legal escape. */
+  const uint64_t us = bs & (u_at >> 1);
+  const uint64_t other = (bs & ~us) & safe2;
+  if (JSOC_UNLIKELY((other & ~(esc >> 1)) != 0))
+    return false;
+
+  /* `\u` escapes: all four following bytes must be hex digits.  Shifting the
+   * mask makes this a single AND per escape-free block. */
+  const uint64_t hex4 = hex & (hex >> 1) & (hex >> 2) & (hex >> 3);
+  if (JSOC_UNLIKELY(((us & safe6) & ~(hex4 >> 2)) != 0))
+    return false;
+
+  /* Escapes too close to the block edge (and any position where the following
+   * bytes are not visible) go through the authoritative scalar check. */
+  uint64_t rest = (bs & ~safe2) | (us & ~safe6 & safe2);
+  while (rest != 0) {
+    const unsigned b = (unsigned)__builtin_ctzll(rest);
+    rest &= rest - 1;
     const size_t g = base + b;
     const size_t e = g + 1;
     if (JSOC_UNLIKELY(e >= length))
@@ -1489,7 +1600,7 @@ stage1_compute_block(stage1_t *st, const char *input, size_t length,
     if (JSOC_UNLIKELY(((m.backslash | m.control) & in_string & valid_mask) !=
                       0)) {
 #ifndef JSOC_EXP_S1_NO_SPECIALS
-      if (!stage1_check_specials(input, length, base,
+      if (!stage1_check_specials(input, length, block, base,
                                  m.backslash & ~escaped & valid_mask,
                                  m.control & valid_mask, in_string)) {
         return false;
