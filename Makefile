@@ -66,8 +66,8 @@ BENCH_BIN     = $(BUILD_DIR)/bench
 TARGETS = $(STATIC_LIB) $(SHARED_LIB) $(TEST_BIN) $(DOM_TEST_BIN) \
           $(TOPIC_BINS) $(CORPUS_BIN) $(BENCH_BIN) $(FUZZ_BIN)
 
-# Default benchmark inputs (generated under /tmp/opencode).
-BENCH_ARGS ?= /tmp/opencode/bench_compact.json /tmp/opencode/bench_pretty.json
+# Default benchmark inputs (persistent under ~/bench_corpus).
+BENCH_ARGS ?= ~/bench_corpus/twitter.json ~/bench_corpus/citm_catalog.json
 
 # Conformance corpora.  Fetch them once with `make fetch-testdata`.
 TEST_DATA ?= ~/simdjson-data
@@ -96,16 +96,14 @@ ubsan:         EXTRA_CFLAGS += -O1 -g -fsanitize=undefined
 ubsan:         LDFLAGS      += -fsanitize=undefined
 
 debug release release-native asan asan-native tsan ubsan: $(TARGETS)
+	@printf '%s\n' '$(CC) $(CFLAGS) $(LDFLAGS)' > $(BUILD_DIR)/.cflags
 
 # --- Rules -----------------------------------------------------------------
-# Stamp of the effective command line.  Changing optimisation target (or
-# PORTABLE) invalidates every object, even though the build directory is
-# shared.  The recipe only rewrites the file when the contents differ, so
-# unchanged builds keep their timestamps.
-$(BUILD_DIR)/.cflags: FORCE
+# Stamp of the effective command line.  Written by the variant targets above.
+# Object files depend on it so a variant change rebuilds everything.
+$(BUILD_DIR)/.cflags:
 	@mkdir -p $(BUILD_DIR)
-	@printf '%s\n' '$(CC) $(CFLAGS) $(LDFLAGS)' | cmp -s - $@ 2>/dev/null || \
-	  printf '%s\n' '$(CC) $(CFLAGS) $(LDFLAGS)' > $@
+	@printf '%s\n' '$(CC) $(CFLAGS) $(LDFLAGS)' > $@
 
 $(BUILD_DIR)/%.o: $(SRC_DIR)/%.c $(BUILD_DIR)/.cflags
 	@mkdir -p $(BUILD_DIR)
@@ -120,49 +118,54 @@ $(SHARED_LIB): $(OBJECTS)
 
 # The differential fuzz test includes tokenizer_internal.h to drive the SIMD
 # and portable backends directly.
-$(TEST_BIN): $(TEST_SOURCES) $(SRC_DIR)/tokenizer_internal.h $(STATIC_LIB) $(BUILD_DIR)/.cflags
+$(TEST_BIN): $(TEST_SOURCES) $(SRC_DIR)/tokenizer_internal.h $(STATIC_LIB)
 	$(CC) $(CFLAGS) -I$(SRC_DIR) -o $@ $(TEST_SOURCES) $(STATIC_LIB) $(LDFLAGS) $(LDLIBS)
 
-$(BENCH_BIN): $(BENCH_SOURCES) $(STATIC_LIB) $(BUILD_DIR)/.cflags
+$(BENCH_BIN): $(BENCH_SOURCES) $(STATIC_LIB)
 	$(CC) $(CFLAGS) -o $@ $(BENCH_SOURCES) $(STATIC_LIB) $(LDFLAGS) $(LDLIBS)
 
-$(DOM_TEST_BIN): $(DOM_TEST_SOURCES) $(INCLUDE_DIR)/dom.h $(SRC_DIR)/dom_internal.h $(STATIC_LIB) $(BUILD_DIR)/.cflags
+$(DOM_TEST_BIN): $(DOM_TEST_SOURCES) $(INCLUDE_DIR)/dom.h $(SRC_DIR)/dom_internal.h $(STATIC_LIB)
 	$(CC) $(CFLAGS) -I$(SRC_DIR) -o $@ $(DOM_TEST_SOURCES) $(STATIC_LIB) $(LDFLAGS) $(LDLIBS)
 
-$(CORPUS_BIN): $(CORPUS_SOURCES) $(SRC_DIR)/dom_internal.h $(STATIC_LIB) $(BUILD_DIR)/.cflags
+$(CORPUS_BIN): $(CORPUS_SOURCES) $(SRC_DIR)/dom_internal.h $(STATIC_LIB)
 	$(CC) $(CFLAGS) -I$(SRC_DIR) -o $@ $(CORPUS_SOURCES) $(STATIC_LIB) $(LDFLAGS) $(LDLIBS)
 
 # One rule for every topic suite: they are independent binaries.
-$(BUILD_DIR)/test_%: $(TEST_DIR)/test_%.c test/test.h $(INCLUDE_DIR)/jsoc.h $(STATIC_LIB) $(BUILD_DIR)/.cflags
+$(BUILD_DIR)/test_%: $(TEST_DIR)/test_%.c test/test.h $(INCLUDE_DIR)/jsoc.h $(STATIC_LIB)
 	$(CC) $(CFLAGS) -I$(TEST_DIR) -I$(SRC_DIR) -o $@ $< $(STATIC_LIB) $(LDFLAGS) $(LDLIBS)
 
 # The fuzz driver: standalone, deterministic, bounded by FUZZ_ITERS.
-$(FUZZ_BIN): $(FUZZ_SOURCES) $(INCLUDE_DIR)/jsoc.h $(STATIC_LIB) $(BUILD_DIR)/.cflags
+$(FUZZ_BIN): $(FUZZ_SOURCES) $(INCLUDE_DIR)/jsoc.h $(STATIC_LIB)
 	$(CC) $(CFLAGS) -I$(SRC_DIR) -o $@ $< $(STATIC_LIB) $(LDFLAGS) $(LDLIBS)
 
 -include $(DEPS)
 
 # --- Convenience -----------------------------------------------------------
-test: release
+# These targets are phony - they just run the already-built binaries.
+# Build the desired variant first:  make release-native && make test
+.PHONY: test bench corpus fuzz
+
+test:
 	./$(TEST_BIN)
 	./$(DOM_TEST_BIN)
 	@for t in $(TOPIC_TESTS); do ./$(BUILD_DIR)/test_$$t || exit 1; done
 
-bench: release
+bench:
 	./$(BENCH_BIN) $(BENCH_ARGS)
 
 # Acceptance corpora.  Fetch them first (`make fetch-testdata`) or pass
 # CORPUS_ARGS explicitly (quote it: make reads every word as a target).
 CORPUS_ARGS ?= $(TEST_DATA)/jsonchecker $(TEST_DATA)/JSONTestSuite/test_parsing \
              $(TEST_DATA)/jsonexamples
-corpus: release
+corpus:
 	./$(CORPUS_BIN) $(CORPUS_ARGS)
 
 # Deterministic fuzz smoke run (what CI does): every target, a fixed seed, a
 # bounded number of iterations.
-fuzz: release
+fuzz:
 	./$(FUZZ_BIN) $(FUZZ_TARGET) $(FUZZ_SEED) $(FUZZ_ITERS)
 
+# ASan check: depends on asan build variant to ensure sanitizer is enabled.
 check: asan
 	./$(TEST_BIN)
 	./$(DOM_TEST_BIN)
