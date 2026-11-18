@@ -36,7 +36,7 @@ ROOT_DIR    = .
 SOURCES = $(SRC_DIR)/arena.c $(SRC_DIR)/error.c $(SRC_DIR)/token.c \
           $(SRC_DIR)/tokenizer.c $(SRC_DIR)/dom.c $(SRC_DIR)/path.c \
           $(SRC_DIR)/writer.c $(SRC_DIR)/serialize.c $(SRC_DIR)/cursor.c \
-          $(SRC_DIR)/decode.c $(SRC_DIR)/encode.c
+          $(SRC_DIR)/decode.c $(SRC_DIR)/decode_direct.c $(SRC_DIR)/number.c $(SRC_DIR)/encode.c
 OBJECTS = $(SOURCES:$(SRC_DIR)/%.c=$(BUILD_DIR)/%.o)
 DEPS    = $(OBJECTS:.o=.d)
 

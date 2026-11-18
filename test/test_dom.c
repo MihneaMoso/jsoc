@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include "cursor.h"
+#include "jsoc.h"
 #include "decode.h"
 #include "dom_internal.h"
 #include <math.h>
