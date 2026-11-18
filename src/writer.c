@@ -1,7 +1,8 @@
 #include "writer.h"
 
-#include <stdio.h>
-#include <stdlib.h>
+#include "simd.h"
+#include "text.h"
+
 #include <string.h>
 
 JSOC_API void jsoc_writer_init(jsoc_writer *w, jsoc_arena *arena, size_t hint) {
@@ -109,45 +110,65 @@ JSOC_API bool jsoc_writer_string(jsoc_writer *w, const char *data, size_t len) {
     return false;
   if (!writer_separator(w) || !writer_char(w, '"'))
     return false;
-  size_t run_start = 0;
-  for (size_t i = 0; i < len; i++) {
-    const unsigned char c = (unsigned char)data[i];
-    char esc = 0;
-    if (c == '"')
-      esc = '"';
-    else if (c == '\\')
-      esc = '\\';
-    else if (c == '\b')
-      esc = 'b';
-    else if (c == '\f')
-      esc = 'f';
-    else if (c == '\n')
-      esc = 'n';
-    else if (c == '\r')
-      esc = 'r';
-    else if (c == '\t')
-      esc = 't';
-    else if (c < 0x20)
-      esc = 'u';
-    if (esc == 0)
-      continue;
-    if (i != run_start && !jsoc_writer_raw(w, data + run_start, i - run_start))
+  size_t i = 0;
+  while (i < len) {
+    const size_t special = jsoc_find_string_special(data, len, i);
+    if (special > i && !jsoc_writer_raw(w, data + i, special - i))
       return false;
-    if (esc == 'u') {
-      char seq[6] = {
-          '\\', 'u', '0', '0', hex_digits[c >> 4], hex_digits[c & 0xF]};
-      if (!jsoc_writer_raw(w, seq, sizeof seq))
-        return false;
-    } else {
-      char seq[2] = {'\\', esc};
-      if (!jsoc_writer_raw(w, seq, sizeof seq))
-        return false;
+    if (special >= len)
+      break;
+    const unsigned char c = (unsigned char)data[special];
+    char seq[6];
+    size_t n;
+    switch (c) {
+    case '"':
+      seq[0] = '\\';
+      seq[1] = '"';
+      n = 2;
+      break;
+    case '\\':
+      seq[0] = '\\';
+      seq[1] = '\\';
+      n = 2;
+      break;
+    case '\b':
+      seq[0] = '\\';
+      seq[1] = 'b';
+      n = 2;
+      break;
+    case '\f':
+      seq[0] = '\\';
+      seq[1] = 'f';
+      n = 2;
+      break;
+    case '\n':
+      seq[0] = '\\';
+      seq[1] = 'n';
+      n = 2;
+      break;
+    case '\r':
+      seq[0] = '\\';
+      seq[1] = 'r';
+      n = 2;
+      break;
+    case '\t':
+      seq[0] = '\\';
+      seq[1] = 't';
+      n = 2;
+      break;
+    default:
+      seq[0] = '\\';
+      seq[1] = 'u';
+      seq[2] = '0';
+      seq[3] = '0';
+      seq[4] = hex_digits[c >> 4];
+      seq[5] = hex_digits[c & 0xF];
+      n = 6;
+      break;
     }
-    run_start = i + 1;
-  }
-  if (len != run_start &&
-      !jsoc_writer_raw(w, data + run_start, len - run_start)) {
-    return false;
+    if (!jsoc_writer_raw(w, seq, n))
+      return false;
+    i = special + 1;
   }
   return writer_char(w, '"');
 }
@@ -159,54 +180,37 @@ JSOC_API bool jsoc_writer_string_cstr(jsoc_writer *w, const char *data) {
 }
 
 JSOC_API bool jsoc_writer_int64(jsoc_writer *w, int64_t value) {
-  char buf[24];
-  int n = snprintf(buf, sizeof buf, "%lld", (long long)value);
-  if (n < 0 || (size_t)n >= sizeof buf)
-    return false;
   if (!writer_separator(w))
     return false;
-  return jsoc_writer_raw(w, buf, (size_t)n);
+  const bool negative = value < 0;
+  const uint64_t magnitude =
+      negative ? (uint64_t)0 - (uint64_t)value : (uint64_t)value;
+  char buf[24];
+  char *end = jsoc_u64_write(buf + (negative ? 1 : 0), magnitude);
+  if (negative)
+    buf[0] = '-';
+  return jsoc_writer_raw(w, buf, (size_t)(end - buf));
 }
 
 JSOC_API bool jsoc_writer_uint64(jsoc_writer *w, uint64_t value) {
-  char buf[24];
-  int n = snprintf(buf, sizeof buf, "%llu", (unsigned long long)value);
-  if (n < 0 || (size_t)n >= sizeof buf)
-    return false;
   if (!writer_separator(w))
     return false;
-  return jsoc_writer_raw(w, buf, (size_t)n);
+  char buf[24];
+  char *end = jsoc_u64_write(buf, value);
+  return jsoc_writer_raw(w, buf, (size_t)(end - buf));
 }
 
 JSOC_API bool jsoc_writer_double(jsoc_writer *w, double value) {
   if (!writer_separator(w))
     return false;
-  /* Non-finite values have no JSON spelling; `null` keeps the text valid. */
-  if (value != value || value > 1.7976931348623157e308 ||
-      value < -1.7976931348623157e308) {
-    return jsoc_writer_raw(w, "null", 4);
-  }
-
-  /* Shortest representation that reads back bit-identically. */
+  /* Non-finite values have no JSON spelling; `null` keeps the text valid.
+   * `jsoc_double_text` writes the shortest spelling that reads back
+   * bit-identically, and "null" for non-finite input. */
   char buf[32];
-  for (int precision = 1; precision <= 17; precision++) {
-    int n = snprintf(buf, sizeof buf, "%.*g", precision, value);
-    if (n < 0 || (size_t)n >= sizeof buf)
-      return false;
-    if (strtod(buf, NULL) == value)
-      break;
-    if (precision == 17)
-      return false;
-  }
-  /* `%g` may drop the fraction ("1" for 1.0).  JSON does not distinguish
-   * integer and floating-point values, so that spelling is fine. */
-
-  /* Locale-independent text: never accept a decimal comma. */
-  for (char *p = buf; *p; p++) {
-    if (*p == ',')
-      *p = '.';
-  }
-  return jsoc_writer_raw(w, buf, strlen(buf));
+  const size_t n = jsoc_double_text(value, buf);
+  if (!n)
+    return false;
+  return jsoc_writer_raw(w, buf, n);
 }
 
 JSOC_API bool jsoc_writer_bool(jsoc_writer *w, bool value) {

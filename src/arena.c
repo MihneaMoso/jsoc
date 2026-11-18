@@ -10,6 +10,8 @@
  * the arena is reset or destroyed.
  */
 #include "arena.h"
+
+#include "arena_internal.h"
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -136,4 +138,19 @@ JSOC_API void *jsoc_arena_alloc_zero(jsoc_arena *a, size_t size, size_t align) {
   if (ptr)
     memset(ptr, 0, size);
   return ptr;
+}
+
+JSOC_INTERNAL char *jsoc_arena_tail(jsoc_arena *a, size_t *length) {
+  if (!a || !length)
+    return NULL;
+  *length = a->capacity - a->offset;
+  return (char *)a->base + a->offset;
+}
+
+JSOC_INTERNAL char *jsoc_arena_commit(jsoc_arena *a, size_t used) {
+  if (!a || used > a->capacity - a->offset)
+    return NULL;
+  char *p = (char *)a->base + a->offset;
+  a->offset += used;
+  return p;
 }

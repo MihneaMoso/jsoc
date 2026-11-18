@@ -32,6 +32,14 @@ JSOC_API bool jsoc_value_minify(const jsoc_document *doc, const jsoc_value *v,
                                 jsoc_arena *arena,
                                 jsoc_string *out) JSOC_NODISCARD;
 
+/* Raw minify: strip JSON whitespace without validating the input structure.
+ * The result is always valid JSON if the input was valid JSON; malformed input
+ * produces invalid output.  This is a SIMD-accelerated fast path for when the
+ * caller already trusts the input.  Output is written into `arena`. */
+JSOC_API bool jsoc_minify_raw(const char *input, size_t length,
+                              jsoc_arena *arena, jsoc_string *out)
+    JSOC_NODISCARD;
+
 #ifdef __cplusplus
 }
 #endif

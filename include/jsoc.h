@@ -1,6 +1,7 @@
 #pragma once
 #include "arena.h"
 #include "dom.h"
+#include "encode.h"
 #include "error.h"
 #include "export.h"
 #include "path.h"

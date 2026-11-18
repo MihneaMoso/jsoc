@@ -26,6 +26,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 #if !defined(JSOC_NO_SIMD) && (defined(__GNUC__) || defined(__clang__))
 #  if defined(__AVX2__)
@@ -143,6 +144,61 @@ static JSOC_NOINLINE size_t jsoc_find_string_special_long(const char *p, size_t 
 /* ------------------------------------------------------------------------- */
 /* Inlined hot paths                                                         */
 /* ------------------------------------------------------------------------- */
+
+/* Copy `n` bytes from `s` to `d`; returns `d + n`.
+ *
+ * This is the serializer's memcpy.  A document is mostly many medium-length
+ * strings, so the libc call and its size dispatch are a large share of the
+ * work.  The 32/16/8-byte paths are overlap-correct - the second store of a
+ * pair ends exactly at d + n - so they never touch a byte outside the
+ * caller's buffer even though they copy unaligned. */
+static inline JSOC_ALWAYS_INLINE char *jsoc_copy_out(char *d, const char *s,
+                                                     size_t n) {
+#if JSOC_SIMD_AVX2
+  if (n >= 32) {
+    size_t i = 0;
+    do {
+      _mm256_storeu_si256(
+          (__m256i *)(void *)(d + i),
+          _mm256_loadu_si256((const __m256i *)(const void *)(s + i)));
+      i += 32;
+    } while (i + 32 <= n);
+    _mm256_storeu_si256(
+        (__m256i *)(void *)(d + n - 32),
+        _mm256_loadu_si256((const __m256i *)(const void *)(s + n - 32)));
+    return d + n;
+  }
+  if (n >= 16) {
+    _mm_storeu_si128((__m128i *)(void *)d,
+                     _mm_loadu_si128((const __m128i *)(const void *)s));
+    _mm_storeu_si128((__m128i *)(void *)(d + n - 16),
+                     _mm_loadu_si128((const __m128i *)(const void *)(s + n - 16)));
+    return d + n;
+  }
+#endif
+  if (n >= 8) {
+    uint64_t a, b;
+    memcpy(&a, s, 8);
+    memcpy(&b, s + n - 8, 8);
+    memcpy(d, &a, 8);
+    memcpy(d + n - 8, &b, 8);
+  } else if (n >= 4) {
+    uint32_t a, b;
+    memcpy(&a, s, 4);
+    memcpy(&b, s + n - 4, 4);
+    memcpy(d, &a, 4);
+    memcpy(d + n - 4, &b, 4);
+  } else if (n >= 2) {
+    uint16_t a, b;
+    memcpy(&a, s, 2);
+    memcpy(&b, s + n - 2, 2);
+    memcpy(d, &a, 2);
+    memcpy(d + n - 2, &b, 2);
+  } else if (n != 0) {
+    *d = *s;
+  }
+  return d + n;
+}
 
 /* Number of consecutive ASCII digits starting at p[i], capped at len - i. */
 static inline JSOC_ALWAYS_INLINE size_t jsoc_digit_run(const char *p, size_t len, size_t i) {

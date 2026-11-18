@@ -44,8 +44,7 @@ jsoc_decode_result jsoc_decode_scalar(jsoc_decode_kind kind,
                                     : JSOC_DECODE_TYPE_MISMATCH,
                                 0, NULL};
   case JSOC_DECODE_DOUBLE:
-    return (jsoc_decode_result){(v->type == JSOC_VALUE_NUMBER ||
-                                 jsoc_value_get_double(doc, v, (double *)out))
+    return (jsoc_decode_result){jsoc_value_get_double(doc, v, (double *)out)
                                     ? JSOC_DECODE_OK
                                     : JSOC_DECODE_TYPE_MISMATCH,
                                 0, NULL};

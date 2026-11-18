@@ -36,7 +36,7 @@ ROOT_DIR    = .
 SOURCES = $(SRC_DIR)/arena.c $(SRC_DIR)/error.c $(SRC_DIR)/token.c \
           $(SRC_DIR)/tokenizer.c $(SRC_DIR)/dom.c $(SRC_DIR)/path.c \
           $(SRC_DIR)/writer.c $(SRC_DIR)/serialize.c $(SRC_DIR)/cursor.c \
-          $(SRC_DIR)/decode.c
+          $(SRC_DIR)/decode.c $(SRC_DIR)/encode.c
 OBJECTS = $(SOURCES:$(SRC_DIR)/%.c=$(BUILD_DIR)/%.o)
 DEPS    = $(OBJECTS:.o=.d)
 
@@ -50,7 +50,7 @@ DOM_TEST_SOURCES = $(TEST_DIR)/test_dom.c
 DOM_TEST_BIN     = $(BUILD_DIR)/test_dom
 
 # Suites ported from simdjson's tests/ (one binary per topic).
-TOPIC_TESTS := numbers errors stream pointer minify padding unicode static
+TOPIC_TESTS := numbers errors stream pointer minify padding unicode static encode
 TOPIC_SOURCES = $(addprefix $(TEST_DIR)/test_,$(addsuffix .c,$(TOPIC_TESTS)))
 TOPIC_BINS    = $(addprefix $(BUILD_DIR)/test_,$(TOPIC_TESTS))
 

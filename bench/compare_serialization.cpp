@@ -27,6 +27,7 @@
 extern "C" {
 #include "jsoc.h"
 #include "decode.h"
+#include "encode.h"
 }
 
 #include <algorithm>
@@ -261,59 +262,39 @@ static const jsoc_decode_field jsoc_twitter_fields[] = {
     {.name = NULL},
 };
 
-static void jsoc_write_string(jsoc_writer *w, const jsoc_string &s) {
-  jsoc_writer_string(w, s.data, s.length);
-}
+static const jsoc_encode_field jsoc_user_enc[] = {
+    JSOC_ENCODE_FIELD_A(jsoc_user, id, JSOC_ENCODE_UINT64),
+    JSOC_ENCODE_FIELD_A(jsoc_user, name, JSOC_ENCODE_STRING_RAW),
+    JSOC_ENCODE_FIELD_A(jsoc_user, screen_name, JSOC_ENCODE_STRING_RAW),
+    JSOC_ENCODE_FIELD_A(jsoc_user, location, JSOC_ENCODE_STRING_RAW),
+    JSOC_ENCODE_FIELD_A(jsoc_user, description, JSOC_ENCODE_STRING_RAW),
+    JSOC_ENCODE_FIELD_A(jsoc_user, verified, JSOC_ENCODE_BOOL),
+    JSOC_ENCODE_FIELD_A(jsoc_user, followers_count, JSOC_ENCODE_UINT64),
+    JSOC_ENCODE_FIELD_A(jsoc_user, friends_count, JSOC_ENCODE_UINT64),
+    JSOC_ENCODE_FIELD_A(jsoc_user, statuses_count, JSOC_ENCODE_UINT64),
+    {.name = NULL},
+};
 
-static void jsoc_write_user(jsoc_writer *w, const jsoc_user *u) {
-  jsoc_writer_object_begin(w);
-  jsoc_writer_object_key(w, "id", 2);
-  jsoc_writer_uint64(w, u->id);
-  jsoc_writer_object_key(w, "name", 4);
-  jsoc_write_string(w, u->name);
-  jsoc_writer_object_key(w, "screen_name", 11);
-  jsoc_write_string(w, u->screen_name);
-  jsoc_writer_object_key(w, "location", 8);
-  jsoc_write_string(w, u->location);
-  jsoc_writer_object_key(w, "description", 11);
-  jsoc_write_string(w, u->description);
-  jsoc_writer_object_key(w, "verified", 8);
-  jsoc_writer_bool(w, u->verified);
-  jsoc_writer_object_key(w, "followers_count", 15);
-  jsoc_writer_uint64(w, u->followers_count);
-  jsoc_writer_object_key(w, "friends_count", 13);
-  jsoc_writer_uint64(w, u->friends_count);
-  jsoc_writer_object_key(w, "statuses_count", 14);
-  jsoc_writer_uint64(w, u->statuses_count);
-  jsoc_writer_object_end(w);
-}
+static const jsoc_encode_field jsoc_status_enc[] = {
+    JSOC_ENCODE_FIELD_A(jsoc_status, created_at, JSOC_ENCODE_STRING_RAW),
+    JSOC_ENCODE_FIELD_A(jsoc_status, id, JSOC_ENCODE_UINT64),
+    JSOC_ENCODE_FIELD_A(jsoc_status, text, JSOC_ENCODE_STRING_RAW),
+    JSOC_ENCODE_FIELD_A(jsoc_status, user, JSOC_ENCODE_STRUCT,
+                        .nested = jsoc_user_enc),
+    JSOC_ENCODE_FIELD_A(jsoc_status, retweet_count, JSOC_ENCODE_UINT64),
+    JSOC_ENCODE_FIELD_A(jsoc_status, favorite_count, JSOC_ENCODE_UINT64),
+    {.name = NULL},
+};
 
-static void jsoc_write_status(jsoc_writer *w, const jsoc_status *s) {
-  jsoc_writer_object_begin(w);
-  jsoc_writer_object_key(w, "created_at", 10);
-  jsoc_write_string(w, s->created_at);
-  jsoc_writer_object_key(w, "id", 2);
-  jsoc_writer_uint64(w, s->id);
-  jsoc_writer_object_key(w, "text", 4);
-  jsoc_write_string(w, s->text);
-  jsoc_writer_object_key(w, "user", 4);
-  jsoc_write_user(w, &s->user);
-  jsoc_writer_object_key(w, "retweet_count", 13);
-  jsoc_writer_uint64(w, s->retweet_count);
-  jsoc_writer_object_key(w, "favorite_count", 14);
-  jsoc_writer_uint64(w, s->favorite_count);
-  jsoc_writer_object_end(w);
-}
-
-static void jsoc_write_twitter(jsoc_writer *w, const jsoc_twitter *t) {
-  jsoc_writer_object_begin(w);
-  jsoc_writer_object_key(w, "statuses", 8);
-  jsoc_writer_array_begin(w);
-  for (size_t i = 0; i < t->status_count; i++)
-    jsoc_write_status(w, &t->statuses[i]);
-  jsoc_writer_array_end(w);
-  jsoc_writer_object_end(w);
-}
+static const jsoc_encode_field jsoc_twitter_enc[] = {
+    JSOC_ENCODE_FIELD_A(jsoc_twitter, statuses, JSOC_ENCODE_ARRAY,
+                        .count_offset = offsetof(jsoc_twitter, status_count),
+                        .item_kind = JSOC_ENCODE_STRUCT,
+                        .item_size = sizeof(jsoc_status),
+                        .items = jsoc_status_enc,
+                        .max_items = 256),
+    {.name = NULL},
+};
 
 /* ------------------------------------------------------------------ */
 /* Per-mode runners                                                    */
@@ -462,8 +443,7 @@ static std::vector<Sample> run_raw_minify(int argc, char **argv, int first_arg) 
     std::vector<char> dst(length + simdjson::SIMDJSON_PADDING);
     size_t dst_len = 0;
     jsoc_string jout{};
-    jsoc_error err{};
-    if (!jsoc_minify(buf.data(), length, a, &jout, &err)) {
+    if (!jsoc_minify_raw(buf.data(), length, a, &jout)) {
       jsoc_arena_destroy(a);
       continue;
     }
@@ -479,8 +459,7 @@ static std::vector<Sample> run_raw_minify(int argc, char **argv, int first_arg) 
         [&] {
           jsoc_arena_reset(a);
           jsoc_string o{};
-          jsoc_error e{};
-          if (!jsoc_minify(buf.data(), length, a, &o, &e)) std::abort();
+          if (!jsoc_minify_raw(buf.data(), length, a, &o)) std::abort();
         },
         [&] {
           size_t n = 0;
@@ -619,14 +598,10 @@ static std::vector<Sample> run_typed(int argc, char **argv, int first_arg,
     jsoc_string jout{};
     if (serialize) {
       jsoc_arena_reset(work_arena);
-      jsoc_writer w;
-      jsoc_writer_init(&w, work_arena, 1024);
-      jsoc_write_twitter(&w, &jt);
-      if (w.failed) {
+      if (!jsoc_encode_object(jsoc_twitter_enc, 1, &jt, work_arena, &jout)) {
         jsoc_arena_destroy(parse_arena); jsoc_arena_destroy(work_arena);
         continue;
       }
-      jout = jsoc_string{jsoc_writer_data(&w), jsoc_writer_size(&w)};
       sj_out = new std::string(simdjson::to_json_string(st));
       if (jout.length == 0 || sj_out->empty()) {
         delete sj_out; jsoc_arena_destroy(parse_arena);
@@ -661,10 +636,9 @@ static std::vector<Sample> run_typed(int argc, char **argv, int first_arg,
       time_pair(
           [&] {
             jsoc_arena_reset(work_arena);
-            jsoc_writer w;
-            jsoc_writer_init(&w, work_arena, 1024);
-            jsoc_write_twitter(&w, &jt);
-            if (w.failed) std::abort();
+            jsoc_string o{};
+            if (!jsoc_encode_object(jsoc_twitter_enc, 1, &jt, work_arena, &o))
+              std::abort();
           },
           [&] {
             std::string s = simdjson::to_json_string(st);

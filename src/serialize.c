@@ -1,6 +1,7 @@
 #include "serialize.h"
 
 #include "dom_internal.h"
+#include "simd.h"
 
 #include <stdint.h>
 #include <string.h>
@@ -178,4 +179,119 @@ JSOC_API bool jsoc_minify(const char *input, size_t length, jsoc_arena *arena,
     return false;
 
   return jsoc_document_minify(&doc, arena, out);
+}
+
+/* ------------------------------------------------------------------------- */
+/* Raw minify: SIMD whitespace strip without validation                       */
+/* ------------------------------------------------------------------------- */
+
+static inline JSOC_ALWAYS_INLINE size_t jsoc_skip_ws_simd(const char *p,
+                                                          size_t len,
+                                                          size_t i) {
+#if JSOC_SIMD_AVX2
+  while (i + 32 <= len) {
+    const __m256i v = _mm256_loadu_si256((const __m256i *)(const void *)(p + i));
+    const __m256i ws = _mm256_set1_epi8(0x20);
+    const __m256i ctl = _mm256_set1_epi8(0x1F);
+    const __m256i m1 = _mm256_cmpeq_epi8(v, ws);
+    const __m256i m2 = _mm256_cmpeq_epi8(_mm256_max_epu8(v, ctl), ctl);
+    const uint32_t mask = (uint32_t)_mm256_movemask_epi8(_mm256_or_si256(m1, m2));
+    if (mask != UINT32_MAX)
+      return i + (size_t)__builtin_ctz(~mask);
+    i += 32;
+  }
+#elif JSOC_SIMD_SSE2
+  while (i + 16 <= len) {
+    const __m128i v = _mm_loadu_si128((const __m128i *)(const void *)(p + i));
+    const __m128i ws = _mm_set1_epi8(0x20);
+    const __m128i ctl = _mm_set1_epi8(0x1F);
+    const __m128i m1 = _mm_cmpeq_epi8(v, ws);
+    const __m128i m2 = _mm_cmpeq_epi8(_mm_max_epu8(v, ctl), ctl);
+    const uint32_t mask = (uint16_t)_mm_movemask_epi8(_mm_or_si128(m1, m2));
+    if (mask != 0xFFFFu)
+      return i + (size_t)__builtin_ctz(~mask & 0xFFFFu);
+    i += 16;
+  }
+#endif
+  while (i < len && jsoc_is_ws((unsigned char)p[i]))
+    i++;
+  return i;
+}
+
+/* Find the next whitespace byte at or after i, or len if none.
+ * Optimized for the short runs typical in JSON (avg ~10 bytes). */
+static inline JSOC_ALWAYS_INLINE size_t jsoc_find_next_ws(const char *p,
+                                                          size_t len,
+                                                          size_t i) {
+  /* Fast path: check a small window with scalar code before doing SIMD. */
+  size_t limit = i + 64;
+  if (limit > len) limit = len;
+  while (i < limit) {
+    if (jsoc_is_ws((unsigned char)p[i]))
+      return i;
+    i++;
+  }
+  if (i >= len)
+    return len;
+  /* Slow path: use SIMD for the rest. */
+#if JSOC_SIMD_AVX2
+  while (i + 32 <= len) {
+    const __m256i v = _mm256_loadu_si256((const __m256i *)(const void *)(p + i));
+    const __m256i ws = _mm256_set1_epi8(0x20);
+    const __m256i ctl = _mm256_set1_epi8(0x1F);
+    const __m256i m1 = _mm256_cmpeq_epi8(v, ws);
+    const __m256i m2 = _mm256_cmpeq_epi8(_mm256_max_epu8(v, ctl), ctl);
+    const uint32_t mask = (uint32_t)_mm256_movemask_epi8(_mm256_or_si256(m1, m2));
+    if (mask != 0)
+      return i + (size_t)__builtin_ctz(mask);
+    i += 32;
+  }
+#elif JSOC_SIMD_SSE2
+  while (i + 16 <= len) {
+    const __m128i v = _mm_loadu_si128((const __m128i *)(const void *)(p + i));
+    const __m128i ws = _mm_set1_epi8(0x20);
+    const __m128i ctl = _mm_set1_epi8(0x1F);
+    const __m128i m1 = _mm_cmpeq_epi8(v, ws);
+    const __m128i m2 = _mm_cmpeq_epi8(_mm_max_epu8(v, ctl), ctl);
+    const uint32_t mask = (uint16_t)_mm_movemask_epi8(_mm_or_si128(m1, m2));
+    if (mask != 0)
+      return i + (size_t)__builtin_ctz(mask & 0xFFFFu);
+    i += 16;
+  }
+#endif
+  while (i < len && !jsoc_is_ws((unsigned char)p[i]))
+    i++;
+  return i;
+}
+
+JSOC_API bool jsoc_minify_raw(const char *input, size_t length,
+                              jsoc_arena *arena, jsoc_string *out) {
+  if (out)
+    *out = (jsoc_string){NULL, 0};
+  if (!input || !arena || !out)
+    return false;
+
+  char *data = jsoc_arena_alloc(arena, length + 1, 1);
+  if (!data)
+    return false;
+
+  char *p = data;
+  size_t i = 0;
+
+  while (i < length) {
+    i = jsoc_skip_ws_simd(input, length, i);
+    if (i >= length)
+      break;
+    size_t nws = jsoc_find_next_ws(input, length, i);
+    size_t run = nws - i;
+    if (run) {
+      p = jsoc_copy_out(p, input + i, run);
+    }
+    i = nws;
+  }
+
+  const size_t n = (size_t)(p - data);
+  *p = '\0';
+  *out = (jsoc_string){data, n};
+  return true;
 }
