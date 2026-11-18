@@ -182,7 +182,7 @@ JSOC_API bool jsoc_minify(const char *input, size_t length, jsoc_arena *arena,
 }
 
 /* ------------------------------------------------------------------------- */
-/* Raw minify: SIMD whitespace strip without validation                       */
+/* Raw minify: SIMD whitespace strip using stage1 scanner + compress          */
 /* ------------------------------------------------------------------------- */
 
 static inline JSOC_ALWAYS_INLINE size_t jsoc_skip_ws_simd(const char *p,
@@ -218,52 +218,6 @@ static inline JSOC_ALWAYS_INLINE size_t jsoc_skip_ws_simd(const char *p,
   return i;
 }
 
-/* Find the next whitespace byte at or after i, or len if none.
- * Optimized for the short runs typical in JSON (avg ~10 bytes). */
-static inline JSOC_ALWAYS_INLINE size_t jsoc_find_next_ws(const char *p,
-                                                          size_t len,
-                                                          size_t i) {
-  /* Fast path: check a small window with scalar code before doing SIMD. */
-  size_t limit = i + 64;
-  if (limit > len) limit = len;
-  while (i < limit) {
-    if (jsoc_is_ws((unsigned char)p[i]))
-      return i;
-    i++;
-  }
-  if (i >= len)
-    return len;
-  /* Slow path: use SIMD for the rest. */
-#if JSOC_SIMD_AVX2
-  while (i + 32 <= len) {
-    const __m256i v = _mm256_loadu_si256((const __m256i *)(const void *)(p + i));
-    const __m256i ws = _mm256_set1_epi8(0x20);
-    const __m256i ctl = _mm256_set1_epi8(0x1F);
-    const __m256i m1 = _mm256_cmpeq_epi8(v, ws);
-    const __m256i m2 = _mm256_cmpeq_epi8(_mm256_max_epu8(v, ctl), ctl);
-    const uint32_t mask = (uint32_t)_mm256_movemask_epi8(_mm256_or_si256(m1, m2));
-    if (mask != 0)
-      return i + (size_t)__builtin_ctz(mask);
-    i += 32;
-  }
-#elif JSOC_SIMD_SSE2
-  while (i + 16 <= len) {
-    const __m128i v = _mm_loadu_si128((const __m128i *)(const void *)(p + i));
-    const __m128i ws = _mm_set1_epi8(0x20);
-    const __m128i ctl = _mm_set1_epi8(0x1F);
-    const __m128i m1 = _mm_cmpeq_epi8(v, ws);
-    const __m128i m2 = _mm_cmpeq_epi8(_mm_max_epu8(v, ctl), ctl);
-    const uint32_t mask = (uint16_t)_mm_movemask_epi8(_mm_or_si128(m1, m2));
-    if (mask != 0)
-      return i + (size_t)__builtin_ctz(mask & 0xFFFFu);
-    i += 16;
-  }
-#endif
-  while (i < len && !jsoc_is_ws((unsigned char)p[i]))
-    i++;
-  return i;
-}
-
 JSOC_API bool jsoc_minify_raw(const char *input, size_t length,
                               jsoc_arena *arena, jsoc_string *out) {
   if (out)
@@ -275,23 +229,124 @@ JSOC_API bool jsoc_minify_raw(const char *input, size_t length,
   if (!data)
     return false;
 
+#if JSOC_SIMD_AVX2
+  /* Fast path: use stage1-style scanning to identify whitespace outside
+   * strings, then compress it out with AVX2.  This mirrors simdjson's
+   * json_minifier which runs the stage1 scanner and uses vcompress. */
+  const char *p = input;
+  size_t i = 0;
+  size_t out_pos = 0;
+  uint64_t prev_in_string = 0;
+  uint64_t next_is_escaped = 0;
+
+  while (i + 64 <= length) {
+    const __m256i lo = _mm256_loadu_si256((const __m256i *)(const void *)(p + i));
+    const __m256i hi = _mm256_loadu_si256((const __m256i *)(const void *)(p + i + 32));
+    const jsoc_block_masks m = jsoc_classify64_vec(lo, hi);
+
+    /* Update escape state (same as stage1). */
+    uint64_t escaped = jsoc_escape_next(m.backslash, &next_is_escaped);
+
+    /* Quote mask excluding escaped quotes. */
+    uint64_t quote = m.quote & ~escaped;
+
+    /* in_string: 1 for bytes inside a string.  Carried across blocks. */
+    uint64_t in_string = jsoc_prefix_xor(quote) ^ prev_in_string;
+    prev_in_string = (uint64_t)((int64_t)in_string >> 63);
+
+    /* Whitespace outside strings = whitespace & ~in_string */
+    uint32_t ws_lo = (uint32_t)(m.whitespace & ~in_string);
+    uint32_t ws_hi = (uint32_t)((m.whitespace >> 32) & ~(in_string >> 32));
+
+    /* Compress out the whitespace. */
+    size_t n = jsoc_compress64_avx2((const uint8_t *)(p + i), ws_lo, ws_hi,
+                                    (uint8_t *)(data + out_pos));
+    out_pos += n;
+    i += 64;
+  }
+
+  /* Handle remainder with scalar fallback that tracks string state. */
+  bool in_string_scalar = (prev_in_string != 0);
+  bool escape_next = false;
+  while (i < length) {
+    unsigned char c = (unsigned char)p[i];
+    
+    if (escape_next) {
+      /* This byte is escaped, treat it as ordinary content. */
+      escape_next = false;
+      data[out_pos++] = c;
+      i++;
+      continue;
+    }
+    
+    if (in_string_scalar) {
+      /* Inside a string: only quote and backslash are special. */
+      data[out_pos++] = c;
+      if (c == '\\') {
+        escape_next = true;
+      } else if (c == '"') {
+        in_string_scalar = false;
+      }
+      i++;
+    } else {
+      /* Outside a string: whitespace is removed, quote starts string. */
+      if (jsoc_is_ws(c)) {
+        i++;
+      } else {
+        data[out_pos++] = c;
+        if (c == '"') {
+          in_string_scalar = true;
+        }
+        i++;
+      }
+    }
+  }
+
+  data[out_pos] = '\0';
+  *out = (jsoc_string){data, out_pos};
+  return true;
+
+#else
+  /* Portable fallback: simple scalar scan with string tracking. */
   char *p = data;
   size_t i = 0;
+  bool in_string = false;
+  bool escape_next = false;
 
   while (i < length) {
-    i = jsoc_skip_ws_simd(input, length, i);
-    if (i >= length)
-      break;
-    size_t nws = jsoc_find_next_ws(input, length, i);
-    size_t run = nws - i;
-    if (run) {
-      p = jsoc_copy_out(p, input + i, run);
+    unsigned char c = (unsigned char)input[i];
+    
+    if (escape_next) {
+      escape_next = false;
+      *p++ = c;
+      i++;
+      continue;
     }
-    i = nws;
+    
+    if (in_string) {
+      *p++ = c;
+      if (c == '\\') {
+        escape_next = true;
+      } else if (c == '"') {
+        in_string = false;
+      }
+      i++;
+    } else {
+      if (jsoc_is_ws(c)) {
+        i++;
+      } else {
+        *p++ = c;
+        if (c == '"') {
+          in_string = true;
+        }
+        i++;
+      }
+    }
   }
 
   const size_t n = (size_t)(p - data);
   *p = '\0';
   *out = (jsoc_string){data, n};
   return true;
+#endif
 }
