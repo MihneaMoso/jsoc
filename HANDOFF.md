@@ -2,9 +2,10 @@
 
 Continuation notes for the C23 JSON library.
 
-Last verified: **2026-11-18**, HEAD `151b671` ("fix benchmarks"), clean
-`release-native` build. Treat older numbers in this file as historical; re-run
-the harness after any change.
+Last verified: **2026-11-18**, HEAD `7cfb45c` ("bench: add
+serialization/deserialization comparison harness"), clean `release-native`
+build, all 10 test binaries passing. Treat older numbers in this file as
+historical; re-run the harness after any change.
 
 ## TL;DR state
 
@@ -19,7 +20,7 @@ the harness after any change.
   (`files=2235 pass_ok=250 fail_ok=455 impl_defined=1527 skipped=3`).
 - **DOM parsing is ahead of simdjson 5.1.1** on the benchmark corpus
   (`taskset -c 2`, same process, best of run):
-  - 19 JSON documents: **19/19 wins**, geometric mean **1.27x**.
+  - 19 JSON documents: **19/19 wins**, geometric mean **1.26–1.27x**.
   - 22 JSON documents (adds the three compact API responses): **22/22 wins**,
     geometric mean **1.25x**.
   - Adding `amazon_cellphones.ndjson` to the same run exposes the separate
@@ -716,8 +717,9 @@ Measured on a Ryzen 5 5600, `taskset -c 2`, best-of-run, release-native.
 
 ### DOM parse vs simdjson
 
-- 19 real JSON documents: **19/19 wins**, geometric mean **1.27x**, aggregate
-  throughput jsoc 2.92 GB/s vs simdjson 2.26 GB/s.
+- 19 real JSON documents: **19/19 wins**, geometric mean **1.26–1.27x**
+  (re-measured 1.259x at `7cfb45c`), aggregate throughput jsoc 2.91 GB/s vs
+  simdjson 2.26 GB/s.
 - 22 documents (adds the three compact API responses): **22/22 wins**,
   geomean **1.25x**.
 - Narrowest win is `repeat.json` (~1.01–1.05x), dominated by run-to-run noise
