@@ -1,7 +1,6 @@
 #pragma once
 
 #include "arena.h"
-#include "error.h"
 #include "export.h"
 #include "simd.h"
 
@@ -235,17 +234,3 @@ static inline JSOC_ALWAYS_INLINE jsoc_error_code jsoc_validate_number_checked(
   *out_of_range = bad;
   return JSOC_OK;
 }
-
-
-#ifdef __cplusplus
-}
-#endif
-
-/* Public number parsing functions for direct decode. */
-JSOC_API bool jsoc_number_to_int64(const char *p, size_t n, int64_t *out);
-JSOC_API bool jsoc_number_to_uint64(const char *p, size_t n, uint64_t *out);
-JSOC_API bool jsoc_number_to_double(const char *p, size_t n, double *out);
-
-#ifdef __cplusplus
-}
-#endif

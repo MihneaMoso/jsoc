@@ -1,13 +1,11 @@
 #pragma once
 
-#include "token.h"
 #include "dom.h"
-#include "decode_types.h"
+#include "jsoc.h" /* jsoc_decode_result, jsoc_decode_error */
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
-JSOC_API const char *jsoc_decode_error_message(jsoc_decode_error code) JSOC_CONST JSOC_NODISCARD;
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -39,6 +37,17 @@ extern "C" {
  * `items`/`item_kind` and by the `count_offset` destination, which holds the
  * buffer's capacity on entry and the element count on return.
  */
+
+typedef enum {
+  JSOC_DECODE_BOOL,
+  JSOC_DECODE_INT64,
+  JSOC_DECODE_UINT64,
+  JSOC_DECODE_DOUBLE,
+  JSOC_DECODE_STRING_REF,   /* copies a decoded, NUL-terminated string */
+  JSOC_DECODE_STRING_SLICE, /* stores the raw slice (no copy) */
+  JSOC_DECODE_STRUCT,
+  JSOC_DECODE_ARRAY,
+} jsoc_decode_kind;
 
 typedef struct jsoc_decode_field jsoc_decode_field;
 
@@ -74,6 +83,9 @@ struct jsoc_decode_field {
 #define JSOC_DECODE_FIELD_A(obj, member, knd, ...)                             \
   {.name = #member, .kind = (knd), .offset = offsetof(struct obj, member), ##__VA_ARGS__}
 
+/* Maximum fields per struct (one bool per field is tracked while decoding). */
+#define JSOC_DECODE_MAX_FIELDS 64
+
 /* Decode a JSON object into a struct described by `fields` (which must end
  * with an entry whose `name` is NULL). */
 JSOC_API jsoc_decode_result jsoc_decode_object(const jsoc_decode_field *fields,
@@ -89,14 +101,14 @@ JSOC_API jsoc_decode_result jsoc_decode_scalar(jsoc_decode_kind kind,
                                                const jsoc_document *doc,
                                                const jsoc_value *v, void *out);
 
-/* Decode an array of scalars/structs. */
-JSOC_API jsoc_decode_result jsoc_decode_array(const jsoc_decode_field *field,
-                                              size_t field_count,
-                                              const jsoc_document *doc,
-                                              const jsoc_value *array,
-                                              void *out);
+/* False when the value is an object, true when it is an array. */
+JSOC_API bool jsoc_decode_value_is_array(const jsoc_value *v) JSOC_CONST;
 
-JSOC_API const char *jsoc_decode_error_message(jsoc_decode_error code) JSOC_CONST JSOC_NODISCARD;
+/* Array helper: returns the element at `index`, or NULL. */
+JSOC_API const jsoc_value *jsoc_decode_array_at(const jsoc_document *doc,
+                                                const jsoc_value *array,
+                                                size_t index);
+
 #ifdef __cplusplus
 }
 #endif

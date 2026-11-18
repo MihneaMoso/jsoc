@@ -1,7 +1,5 @@
 #pragma once
 #include "arena.h"
-#include "decode_types.h"
-#include "decode_direct.h"
 #include "dom.h"
 #include "encode.h"
 #include "error.h"
@@ -41,6 +39,23 @@ JSOC_API jsoc_result jsoc_tokenize(const char *input, size_t length,
 JSOC_API jsoc_result jsoc_tokenize_file(const char *path,
                                         jsoc_arena *arena) JSOC_NODISCARD;
 
+typedef enum {
+  JSOC_DECODE_OK = 0,
+  JSOC_DECODE_TYPE_MISMATCH,
+  JSOC_DECODE_MISSING_FIELD,
+  JSOC_DECODE_EXTRA_FIELD,
+  JSOC_DECODE_OVERFLOW,
+  JSOC_DECODE_CUSTOM,
+} jsoc_decode_error;
+
+typedef struct {
+  jsoc_decode_error code;
+  size_t token_index;
+  const char *field_name;
+} jsoc_decode_result;
+
+JSOC_API const char *
+jsoc_decode_error_message(jsoc_decode_error code) JSOC_CONST JSOC_NODISCARD;
 #ifdef __cplusplus
 }
 #endif

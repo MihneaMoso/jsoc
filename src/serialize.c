@@ -1,3 +1,5 @@
+#include <stdio.h>
+#include <errno.h>
 #include "serialize.h"
 
 #include "dom_internal.h"
