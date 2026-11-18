@@ -68,6 +68,8 @@ TARGETS = $(STATIC_LIB) $(SHARED_LIB) $(TEST_BIN) $(DOM_TEST_BIN) \
 
 # Default benchmark inputs (persistent under ~/bench_corpus).
 BENCH_ARGS ?= ~/bench_corpus/twitter.json ~/bench_corpus/citm_catalog.json
+# Serialization/deserialization harness (typed modes need twitter-shaped data).
+BENCH_SER_ARGS ?= ~/bench_corpus/twitter.json
 
 # Conformance corpora.  Fetch them once with `make fetch-testdata`.
 TEST_DATA ?= ~/simdjson-data
@@ -76,7 +78,7 @@ FUZZ_TARGET ?= all
 FUZZ_SEED ?= 1
 
 .PHONY: all clean test bench install uninstall debug release release-native \
-        asan asan-native tsan ubsan format check size FORCE
+        asan asan-native tsan ubsan format check size compare-serialization FORCE
 
 all: release
 
@@ -152,6 +154,12 @@ test:
 
 bench:
 	./$(BENCH_BIN) $(BENCH_ARGS)
+
+# Serialization / deserialization comparison against simdjson.
+# Needs a C++ compiler and a simdjson checkout with build/libsimdjson.a
+# (or pkg-config simdjson).
+compare-serialization:
+	$(BENCH_DIR)/compare_serialization.sh $(BENCH_SER_ARGS)
 
 # Acceptance corpora.  Fetch them first (`make fetch-testdata`) or pass
 # CORPUS_ARGS explicitly (quote it: make reads every word as a target).

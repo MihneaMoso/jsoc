@@ -74,6 +74,16 @@ SIMDJSON_DIR=/path/to/simdjson BENCH_ITERS=200 bench/compare.sh file1.json ...
 simdjson is located from `SIMDJSON_DIR` (a checkout with `singleheader/`), then
 `pkg-config --exists simdjson`, then `/usr/include/simdjson.h`.
 
+For serialization / deserialization, `bench/compare_serialization.sh` measures
+DOM re-serialization, parse+serialize, raw minify, NDJSON streaming, and typed
+decode/encode (the latter needs C++26 static reflection):
+
+```bash
+make compare-serialization
+BENCH_MODE=dom_serialize,roundtrip,raw_minify,stream \
+  bench/compare_serialization.sh ~/bench_corpus/*.json
+```
+
 ## Layout
 
 ```
