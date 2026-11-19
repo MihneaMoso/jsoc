@@ -220,6 +220,65 @@ static inline JSOC_ALWAYS_INLINE size_t jsoc_skip_ws_simd(const char *p,
   return i;
 }
 
+#if JSOC_SIMD_AVX2
+/* Minifying needs only three of the stage1 masks: whitespace, quotes and
+ * backslashes.  The full classifier also derives operators, control bytes and
+ * a non-ASCII flag, which the tokenizer needs for validation but which are
+ * pure overhead here, so the minifier carries its own, narrower loop. */
+static inline JSOC_ALWAYS_INLINE uint64_t
+jsoc_minify_masks64(__m256i lo, __m256i hi, uint64_t *quote,
+                    uint64_t *backslash) {
+  const __m256i ws_table = _mm256_setr_epi8(
+      ' ', 100, 100, 100, 17, 100, 113, 2, 100, '\t', '\n', 112, 100, '\r', 100, 100,
+      ' ', 100, 100, 100, 17, 100, 113, 2, 100, '\t', '\n', 112, 100, '\r', 100, 100);
+  const __m256i quote_ch = _mm256_set1_epi8('"');
+  const __m256i slash_ch = _mm256_set1_epi8('\\');
+  const __m256i wsl = _mm256_cmpeq_epi8(lo, _mm256_shuffle_epi8(ws_table, lo));
+  const __m256i wsh = _mm256_cmpeq_epi8(hi, _mm256_shuffle_epi8(ws_table, hi));
+
+  *quote = jsoc_mask64(
+      (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(lo, quote_ch)),
+      (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(hi, quote_ch)));
+  *backslash = jsoc_mask64(
+      (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(lo, slash_ch)),
+      (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(hi, slash_ch)));
+  return jsoc_mask64((uint32_t)_mm256_movemask_epi8(wsl),
+                     (uint32_t)_mm256_movemask_epi8(wsh));
+}
+
+/* Return the mask of whitespace bytes outside strings for one 64-byte block,
+ * advancing the cross-block string/escape state. */
+static inline JSOC_ALWAYS_INLINE uint64_t
+jsoc_minify_ws64(const char *p, uint64_t *prev_in_string,
+                 uint64_t *next_is_escaped) {
+  const __m256i lo = _mm256_loadu_si256((const __m256i *)(const void *)p);
+  const __m256i hi = _mm256_loadu_si256((const __m256i *)(const void *)(p + 32));
+  uint64_t quote_mask, backslash_mask;
+  const uint64_t ws = jsoc_minify_masks64(lo, hi, &quote_mask, &backslash_mask);
+
+  /* No quote and no backslash: the string state cannot change, so the whole
+   * block is either inside a string (nothing to strip) or outside it (strip
+   * every whitespace byte).  This is common in the indentation-heavy and
+   * escaped corpora and skips the escape scan and the prefix-xor. */
+  if (JSOC_LIKELY((quote_mask | backslash_mask) == 0)) {
+    *next_is_escaped = 0;
+    return *prev_in_string ? 0 : ws;
+  }
+
+  /* Update escape state (same as stage1). */
+  const uint64_t escaped = jsoc_escape_next(backslash_mask, next_is_escaped);
+
+  /* Quote mask excluding escaped quotes. */
+  const uint64_t quote = quote_mask & ~escaped;
+
+  /* in_string: 1 for bytes inside a string.  Carried across blocks. */
+  const uint64_t in_string = jsoc_prefix_xor(quote) ^ *prev_in_string;
+  *prev_in_string = (uint64_t)((int64_t)in_string >> 63);
+
+  return ws & ~in_string;
+}
+#endif /* JSOC_SIMD_AVX2 */
+
 JSOC_API bool jsoc_minify_raw(const char *input, size_t length,
                               jsoc_arena *arena, jsoc_string *out) {
   if (out)
@@ -236,40 +295,54 @@ JSOC_API bool jsoc_minify_raw(const char *input, size_t length,
    * strings, then compress it out with AVX2.  This mirrors simdjson's
    * json_minifier which runs the stage1 scanner and uses vcompress. */
   const char *p = input;
+  char *restrict dst = data;
   size_t i = 0;
   size_t out_pos = 0;
   uint64_t prev_in_string = 0;
   uint64_t next_is_escaped = 0;
 
-  while (i + 64 <= length) {
-    const __m256i lo = _mm256_loadu_si256((const __m256i *)(const void *)(p + i));
-    const __m256i hi = _mm256_loadu_si256((const __m256i *)(const void *)(p + i + 32));
-    const jsoc_block_masks m = jsoc_classify64_vec(lo, hi);
+  /* Two blocks per iteration, like simdjson's json_minifier<128>, so the two
+   * independent compress chains overlap in the pipeline. */
+  while (i + 128 <= length) {
+    const uint64_t w0 =
+        jsoc_minify_ws64(p + i, &prev_in_string, &next_is_escaped);
+    const uint64_t w1 =
+        jsoc_minify_ws64(p + i + 64, &prev_in_string, &next_is_escaped);
 
-    /* Update escape state (same as stage1). */
-    uint64_t escaped = jsoc_escape_next(m.backslash, &next_is_escaped);
+    if (JSOC_LIKELY((w0 | w1) != 0)) {
+      out_pos += jsoc_compress64_avx2(
+          (const uint8_t *)(const void *)(p + i), (uint32_t)w0,
+          (uint32_t)(w0 >> 32), (uint8_t *)(dst + out_pos));
+      out_pos += jsoc_compress64_avx2(
+          (const uint8_t *)(const void *)(p + i + 64), (uint32_t)w1,
+          (uint32_t)(w1 >> 32), (uint8_t *)(dst + out_pos));
+    } else {
+      /* Nothing to strip: a straight 128-byte copy beats two compress
+       * chains, and files whose whitespace is all inside strings hit this
+       * on almost every block. */
+      memcpy(dst + out_pos, p + i, 128);
+      out_pos += 128;
+    }
+    i += 128;
+  }
 
-    /* Quote mask excluding escaped quotes. */
-    uint64_t quote = m.quote & ~escaped;
-
-    /* in_string: 1 for bytes inside a string.  Carried across blocks. */
-    uint64_t in_string = jsoc_prefix_xor(quote) ^ prev_in_string;
-    prev_in_string = (uint64_t)((int64_t)in_string >> 63);
-
-    /* Whitespace outside strings = whitespace & ~in_string */
-    uint32_t ws_lo = (uint32_t)(m.whitespace & ~in_string);
-    uint32_t ws_hi = (uint32_t)((m.whitespace >> 32) & ~(in_string >> 32));
-
-    /* Compress out the whitespace. */
-    size_t n = jsoc_compress64_avx2((const uint8_t *)(p + i), ws_lo, ws_hi,
-                                    (uint8_t *)(data + out_pos));
-    out_pos += n;
+  if (i + 64 <= length) {
+    const uint64_t w =
+        jsoc_minify_ws64(p + i, &prev_in_string, &next_is_escaped);
+    if (JSOC_LIKELY(w != 0)) {
+      out_pos += jsoc_compress64_avx2(
+          (const uint8_t *)(const void *)(p + i), (uint32_t)w,
+          (uint32_t)(w >> 32), (uint8_t *)(dst + out_pos));
+    } else {
+      memcpy(dst + out_pos, p + i, 64);
+      out_pos += 64;
+    }
     i += 64;
   }
 
   /* Handle remainder with scalar fallback that tracks string state. */
   bool in_string_scalar = (prev_in_string != 0);
-  bool escape_next = false;
+  bool escape_next = next_is_escaped;
   while (i < length) {
     unsigned char c = (unsigned char)p[i];
     

@@ -17,6 +17,7 @@
  * only pin jsoc's behaviour.
  */
 #include "test.h"
+#include "simd.h"
 #include <stdint.h>
 #include <string.h>
 
@@ -214,12 +215,70 @@ fail:
   return false;
 }
 
+
+#if JSOC_SIMD_AVX2
+/* The byte-compaction tables are hand-copied from simdjson; a single mistyped
+ * entry silently corrupts minified output (one such typo shipped in
+ * thintable_epi8[62]).  Pin every 8-bit mask at every byte position, every
+ * 16-bit mask in both halves, and a spread of 32-bit masks against a scalar
+ * reference. */
+static bool test_compress_masks(void) {
+  uint8_t src[32], got[64], want[32];
+  for (int i = 0; i < 32; i++)
+    src[i] = (uint8_t)(0x20 + i * 7);
+
+  for (int shift = 0; shift < 32; shift += 8) {
+    for (int m = 0; m < 256; m++) {
+      uint32_t mask = (uint32_t)m << shift;
+      memset(got, 0xEE, sizeof got);
+      size_t n = jsoc_compress32_avx2(src, mask, got);
+      size_t w = 0;
+      for (int i = 0; i < 32; i++)
+        if (!(mask & (1u << i)))
+          want[w++] = src[i];
+      REQUIRE(n == w);
+      REQUIRE(w == 0 || memcmp(got, want, w) == 0);
+    }
+  }
+
+  for (uint32_t m = 0; m < 65536; m++) {
+    uint32_t mask = m | (m << 16);
+    size_t n = jsoc_compress32_avx2(src, mask, got);
+    size_t w = 0;
+    for (int i = 0; i < 32; i++)
+      if (!(mask & (1u << i)))
+        want[w++] = src[i];
+    REQUIRE(n == w);
+    REQUIRE(w == 0 || memcmp(got, want, w) == 0);
+  }
+
+  uint32_t seed = 1;
+  for (int iter = 0; iter < 200000; iter++) {
+    seed = seed * 1664525u + 1013904223u;
+    uint32_t mask = seed;
+    size_t n = jsoc_compress32_avx2(src, mask, got);
+    size_t w = 0;
+    for (int i = 0; i < 32; i++)
+      if (!(mask & (1u << i)))
+        want[w++] = src[i];
+    REQUIRE(n == w);
+    REQUIRE(w == 0 || memcmp(got, want, w) == 0);
+  }
+  return true;
+fail:
+  return false;
+}
+#endif
+
 int main(void) {
   printf("=== jsoc minify tests ===\n\n");
 
   TEST(1, string_escape);
   TEST(2, integer_minify);
   TEST(3, corpus_round_trip);
+#if JSOC_SIMD_AVX2
+  TEST(4, compress_masks);
+#endif
 
   return jsoc_test_finish("minify");
 }

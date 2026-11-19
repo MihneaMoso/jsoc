@@ -407,7 +407,7 @@ static const uint64_t jsoc_thintable_epi8[256] = {
     0x0000000007060302, 0x0000000706030100, 0x0000000007060301,
     0x0000000007060300, 0x0000000000070603, 0x00000706020100,
     0x00000007060201, 0x00000007060200, 0x00000000070602,
-    0x00000007060100, 0x00000000070601, 0x00000000000706,
+    0x00000007060100, 0x00000000070601, 0x00000000070600,
     0x0000000000000706, 0x0007050403020100, 0x0000070504030201,
     0x0000070504030200, 0x0000000705040302, 0x0000070504030100,
     0x0000000705040301, 0x0000000705040300, 0x0000000007050403,
@@ -516,7 +516,7 @@ static const uint8_t jsoc_pshufb_combine_table[272] = {
  * Returns the number of bytes written (0..32). */
 static inline size_t jsoc_compress32_avx2(const uint8_t *src, uint32_t mask,
                                           uint8_t *dst) {
-  __m256i v = _mm256_loadu_si256((const __m256i *)src);
+  __m256i v = _mm256_loadu_si256((const __m256i *)(const void *)src);
 
   uint8_t m1 = (uint8_t)mask;
   uint8_t m2 = (uint8_t)(mask >> 8);
@@ -524,8 +524,8 @@ static inline size_t jsoc_compress32_avx2(const uint8_t *src, uint32_t mask,
   uint8_t m4 = (uint8_t)(mask >> 24);
 
   __m256i shufmask = _mm256_set_epi64x(
-      jsoc_thintable_epi8[m4], jsoc_thintable_epi8[m3],
-      jsoc_thintable_epi8[m2], jsoc_thintable_epi8[m1]);
+      (long long)jsoc_thintable_epi8[m4], (long long)jsoc_thintable_epi8[m3],
+      (long long)jsoc_thintable_epi8[m2], (long long)jsoc_thintable_epi8[m1]);
 
   shufmask = _mm256_add_epi8(
       shufmask,
@@ -554,7 +554,7 @@ static inline size_t jsoc_compress32_avx2(const uint8_t *src, uint32_t mask,
   _mm_storeu_si128((__m128i *)dst, lo);
   _mm_storeu_si128((__m128i *)(dst + 16 - __builtin_popcount(mask & 0xFFFF)), hi);
 
-  return 32 - __builtin_popcount(mask);
+  return (size_t)(32 - __builtin_popcount(mask));
 }
 
 /* Compress 64 bytes by processing two 32-byte halves. */
