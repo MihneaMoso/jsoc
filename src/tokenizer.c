@@ -1559,16 +1559,22 @@ static JSOC_NOINLINE bool stage1_check_specials(const char *input,
 }
 
 static inline JSOC_ALWAYS_INLINE bool
+/* `check_utf8` is false on the stream path, where the whole input was
+ * validated up front: inside a string the per-block check runs for every
+ * block and costs more than the string scan itself.  Both it and `branchless`
+ * are literals at the only call sites, so the inlined body is specialised. */
 stage1_compute_block(stage1_t *st, const char *input, size_t length,
                      const uint8_t *block, size_t base, uint64_t valid_mask,
-                     const bool branchless, uint64_t *out_starts) {
+                     const bool branchless, const bool check_utf8,
+                     uint64_t *out_starts) {
   const __m256i lo = _mm256_loadu_si256((const __m256i *)(const void *)block);
   const __m256i hi =
       _mm256_loadu_si256((const __m256i *)(const void *)(block + 32));
   const jsoc_block_masks m = jsoc_classify64_vec(lo, hi);
 
 #ifndef JSOC_EXP_S1_NO_UTF8
-  if (JSOC_LIKELY((m.quote | st->s1.prev_in_string) != 0)) {
+  if (JSOC_LIKELY(check_utf8) &&
+      JSOC_LIKELY((m.quote | st->s1.prev_in_string) != 0)) {
     if (JSOC_LIKELY(m.nonascii == 0)) {
       st->utf8.error =
           _mm256_or_si256(st->utf8.error, st->utf8.prev_incomplete);
@@ -1730,16 +1736,19 @@ stage1_write_indexes(uint32_t *out, size_t *count, uint64_t starts,
   *count = n;
 }
 
+/* Scan `length` bytes and append one 4-byte index per structural token start
+ * to `indexes[*count ..]`.  `base_offset` shifts the emitted positions so the
+ * indexes are absolute offsets into a larger input, which is what lets a
+ * stream be scanned as several non-overlapping chunks.  `st` carries the
+ * string/UTF-8 state into and out of the scan, so the caller can keep it
+ * between chunks.  It must be zeroed for the first chunk. */
 static inline JSOC_ALWAYS_INLINE bool
-stage1_scan(const char *input, size_t length, uint32_t *indexes,
-            const bool branchless, size_t *out_count) {
-  stage1_t st;
-  memset(&st, 0, sizeof st);
-  jsoc_utf8_state_init(&st.utf8);
-
+stage1_scan_ex(const char *input, size_t length, uint32_t *indexes,
+              const bool branchless, const bool check_utf8, size_t *out_count,
+              size_t base_offset, stage1_t *st) {
   const uint8_t *p = (const uint8_t *)input;
   size_t base = 0;
-  size_t count = 0;
+  size_t count = *out_count;
 
   /* Delay each block's index write by one iteration so it overlaps the next
    * block's classification. */
@@ -1749,13 +1758,14 @@ stage1_scan(const char *input, size_t length, uint32_t *indexes,
 
   while (base + 64 <= length) {
     uint64_t starts;
-    if (JSOC_UNLIKELY(!stage1_compute_block(&st, input, length, p + base, base,
+    if (JSOC_UNLIKELY(!stage1_compute_block(st, input, length, p + base, base,
                                             ~(uint64_t)0, branchless,
-                                            &starts))) {
+                                            check_utf8, &starts))) {
       return false;
     }
     if (have_held)
-      stage1_write_indexes(indexes, &count, held_starts, held_base);
+      stage1_write_indexes(indexes, &count, held_starts,
+                           held_base + base_offset);
     held_starts = starts;
     held_base = base;
     have_held = true;
@@ -1769,21 +1779,27 @@ stage1_scan(const char *input, size_t length, uint32_t *indexes,
     memcpy(block, p + base, rem);
     const uint64_t valid = ((uint64_t)1 << rem) - 1;
     uint64_t starts;
-    if (JSOC_UNLIKELY(!stage1_compute_block(&st, input, length, block, base,
-                                            valid, branchless, &starts))) {
+    if (JSOC_UNLIKELY(!stage1_compute_block(st, input, length, block, base,
+                                            valid, branchless, check_utf8,
+                                            &starts))) {
       return false;
     }
     if (have_held)
-      stage1_write_indexes(indexes, &count, held_starts, held_base);
+      stage1_write_indexes(indexes, &count, held_starts,
+                           held_base + base_offset);
     held_starts = starts;
     held_base = base;
     have_held = true;
   }
   if (have_held)
-    stage1_write_indexes(indexes, &count, held_starts, held_base);
+    stage1_write_indexes(indexes, &count, held_starts, held_base + base_offset);
 
-  st.utf8.error = _mm256_or_si256(st.utf8.error, st.utf8.prev_incomplete);
-  if (JSOC_UNLIKELY(!_mm256_testz_si256(st.utf8.error, st.utf8.error)))
+  /* An incomplete sequence at the end of a chunk means the caller cut a
+   * multibyte character; the caller avoids that and only the final chunk may
+   * legitimately have one. */
+  st->utf8.error = _mm256_or_si256(st->utf8.error, st->utf8.prev_incomplete);
+  if (JSOC_UNLIKELY(check_utf8 &&
+                    !_mm256_testz_si256(st->utf8.error, st->utf8.error)))
     return false;
 
   *out_count = count;
@@ -1800,14 +1816,56 @@ JSOC_INTERNAL bool jsoc_dom_stage1(const char *input, size_t length,
 
   /* `branchless` is a literal at each call so the string-scan branch is
    * compiled out on the wordy path. */
+  stage1_t st;
+  memset(&st, 0, sizeof st);
+  jsoc_utf8_state_init(&st.utf8);
+  size_t count = 0;
+  bool ok;
   if (branchless) {
-    if (!stage1_scan(input, length, indexes, true, out_count))
-      return false;
+    ok = stage1_scan_ex(input, length, indexes, true, true, &count, 0, &st);
   } else {
-    if (!stage1_scan(input, length, indexes, false, out_count))
-      return false;
+    ok = stage1_scan_ex(input, length, indexes, false, true, &count, 0, &st);
   }
+  if (JSOC_UNLIKELY(!ok))
+    return false;
+  *out_count = count;
   *out_indexes = indexes;
+  return true;
+}
+
+JSOC_INTERNAL bool jsoc_dom_stage1_resume(const char *input, size_t length,
+                                         bool branchless, size_t base_offset,
+                                         bool check_utf8, uint32_t *indexes,
+                                         size_t *count,
+                                         jsoc_stage1_batch_state *state) {
+  /* Work on copies so a rejected chunk leaves the carried state (and the
+   * index count) untouched: the caller then retries with a longer window
+   * that re-scans the same bytes. */
+  stage1_t st;
+  st.s1 = state->s1;
+  st.utf8 = state->utf8;
+  st.esc_skip_until = 0;
+  size_t seen = *count;
+
+  /* Four instantiations: the scanner is inlined into each, so both flags are
+   * literals in every copy and no per-block predicate remains. */
+  bool ok;
+  if (branchless) {
+    ok = check_utf8 ? stage1_scan_ex(input, length, indexes, true, true, &seen,
+                                     base_offset, &st)
+                    : stage1_scan_ex(input, length, indexes, true, false, &seen,
+                                     base_offset, &st);
+  } else {
+    ok = check_utf8 ? stage1_scan_ex(input, length, indexes, false, true, &seen,
+                                     base_offset, &st)
+                    : stage1_scan_ex(input, length, indexes, false, false,
+                                     &seen, base_offset, &st);
+  }
+  if (JSOC_UNLIKELY(!ok))
+    return false;
+  state->s1 = st.s1;
+  state->utf8 = st.utf8;
+  *count = seen;
   return true;
 }
 

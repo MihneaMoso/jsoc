@@ -1003,10 +1003,199 @@ static inline bool dom_is_ws(unsigned char c) {
   return c == ' ' || c == '\t' || c == '\n' || c == '\r';
 }
 
+#if JSOC_SIMD_AVX2
+/* Batch size for the streaming split path.  Large enough that the common
+ * document fits in one pass (a retry re-scans the whole window), small enough
+ * that a batch's index stream stays close to the cache. */
+#ifndef JSOC_STREAM_BATCH
+#define JSOC_STREAM_BATCH (65536u)
+#endif
+
+/* Run the split path over the whole stream, one cache-sized batch at a time.
+ *
+
+/* Run the split path over the whole stream as a series of non-overlapping
+ * stage-1 windows.  Each window resumes the previous one's structural state,
+ * so the input is scanned exactly once; the index stream is a single
+ * contiguous array over the whole input, and the document walk simply stops
+ * at the last document the current window completed.
+ *
+ * Returns true when every document was delivered (or the callback stopped,
+ * with *stop set).  A false return means the caller must replay the token
+ * path for exact error semantics; *delivered then counts the documents
+ * already passed to the callback so the replay can skip them. */
+static bool stream_fast_path(const char *input, size_t length,
+                             jsoc_arena *index_arena, bool branchless,
+                             jsoc_arena *arena,
+                             jsoc_document_callback callback, void *user,
+                             size_t *delivered, jsoc_error *stop) {
+  /* One index per token start: a token is at least one byte, so the whole
+   * stream can never produce more than `length` indexes.  The arena only
+   * commits the pages actually written. */
+  uint32_t *indexes = jsoc_arena_alloc(index_arena,
+                                       (length + 64) * sizeof(uint32_t),
+                                       _Alignof(uint32_t));
+  if (JSOC_UNLIKELY(!indexes))
+    return false;
+
+  size_t count = 0;
+  jsoc_stage1_batch_state st;
+  memset(&st, 0, sizeof st);
+
+  /* Document walk state, carried across windows so a document split by a
+   * window edge is continued, not re-walked (re-walking would make the cost
+   * quadratic in the number of windows per document). */
+  size_t pos = 0;    /* first index not delivered yet */
+  size_t scan = 0;   /* next index to examine */
+  unsigned depth = 0; /* nesting depth at `scan` */
+  bool pending = false; /* a document in progress spans the window edge */
+  size_t base = 0;  /* start of the current window */
+  while (base < length) {
+    size_t end = base + JSOC_STREAM_BATCH;
+    if (end > length)
+      end = length;
+    /* A window must end on a UTF-8 character boundary: the scanner carries
+     * the sequence state, but a chunk ending mid-sequence would report an
+     * error that is only real if this is the final chunk. */
+    while (end < length && (unsigned char)input[end] >= 0x80 &&
+           (unsigned char)input[end] < 0xC0)
+      end++;
+
+    for (;;) {
+      const size_t window = end - base;
+      const size_t before = count;
+      /* The whole stream was already validated as UTF-8, so stage 1 only
+       * has to classify structure (and check escapes). */
+      if (jsoc_dom_stage1_resume(input + base, window, branchless, base, false,
+                                 indexes, &count, &st))
+        break;
+      count = before;
+      if (end >= length)
+        return false; /* genuine error: replay the token path */
+      /* An escape sequence was cut by the window edge.  Widen and re-scan
+       * from the start of the window; one widening is almost always enough. */
+      end += 8;
+      if (end > length)
+        end = length;
+      if (end - base > JSOC_STREAM_BATCH * 4u)
+        return false; /* pathological: let the token path do it */
+    }
+
+    const bool final = (end == length);
+    bool incomplete = false;
+    for (;;) {
+      const size_t doc_start = pending ? pos : scan;
+      size_t end_idx;
+      if (!pending) {
+        const unsigned char first = (unsigned char)input[indexes[scan]];
+        if (first == '{' || first == '[') {
+          depth = 1;
+          pending = true;
+          scan++;
+          continue;
+        }
+        if (first == '"') {
+          if (JSOC_UNLIKELY(scan + 1 >= count)) {
+            incomplete = true;
+            break;
+          }
+          end_idx = scan + 2;
+        } else {
+          /* A scalar has no closing index: it is only provably complete when
+           * another index follows it, or the stream ends here. */
+          if (JSOC_UNLIKELY(scan + 1 >= count && !final)) {
+            incomplete = true;
+            break;
+          }
+          end_idx = scan + 1;
+        }
+      } else {
+        bool closed = false;
+        while (scan < count) {
+          const unsigned char c = (unsigned char)input[indexes[scan]];
+          scan++;
+          if (c == '{' || c == '[') {
+            depth++;
+          } else if (c == '}' || c == ']') {
+            if (JSOC_UNLIKELY(depth == 0))
+              return false;
+            depth--;
+            if (depth == 0) {
+              closed = true;
+              break;
+            }
+          }
+        }
+        if (!closed) {
+          incomplete = true;
+          break;
+        }
+        end_idx = scan;
+        pending = false;
+      }
+
+      jsoc_arena_reset(arena);
+      jsoc_document doc;
+      memset(&doc, 0, sizeof doc);
+      doc.error = (jsoc_error)JSOC_ERR_INIT;
+      doc.input = input;
+      doc.length = length;
+      doc.arena = arena;
+
+      if (JSOC_UNLIKELY(!dom_build_indexed(&doc, indexes + doc_start,
+                                           end_idx - doc_start, arena)))
+        return false;
+      if (callback && !callback(&doc, user)) {
+        *stop = (jsoc_error){JSOC_ERR_USER_STOP, 0, 0, 0};
+        return true;
+      }
+      (*delivered)++;
+      pos = end_idx;
+      if (scan >= count)
+        break;
+    }
+    base = end;
+    /* A trailing incomplete document is only a problem at the end of the
+     * stream: earlier windows leave it pending for the next one. */
+    if (incomplete && final)
+      return false;
+    /* Give the window's index space back to the pool instead of letting the
+     * index stream walk forward through all of it: a window's indexes then
+     * stay in the first-level cache instead of streaming to memory. */
+    if (pos > 0) {
+      const size_t rest = count - pos;
+      if (rest > 0)
+        memmove(indexes, indexes + pos, rest * sizeof *indexes);
+      count = rest;
+      /* `scan` is an index into the same array, so it moves with it. */
+      scan -= pos;
+      pos = 0;
+    }
+  }
+  return true;
+}
+
+/* Replay wrapper for the token path: swallow the documents the index fast
+ * path already delivered, then forward to the caller's callback. */
+typedef struct {
+  jsoc_document_callback callback;
+  void *user;
+  size_t skip;
+} stream_skip_ctx;
+
+static bool stream_skip_cb(const jsoc_document *doc, void *user) {
+  stream_skip_ctx *ctx = (stream_skip_ctx *)user;
+  if (ctx->skip) {
+    ctx->skip--;
+    return true;
+  }
+  return ctx->callback ? ctx->callback(doc, ctx->user) : true;
+}
+#endif /* JSOC_SIMD_AVX2 */
+
 JSOC_API jsoc_error jsoc_parse_many(const char *input, size_t length,
                                     jsoc_arena *arena,
-                                    jsoc_document_callback callback,
-                                    void *user) {
+                                    jsoc_document_callback callback, void *user) {
   if (JSOC_UNLIKELY(!input)) {
     return (jsoc_error){JSOC_ERR_SYNTAX, 0, 1, 1};
   }
@@ -1037,6 +1226,48 @@ JSOC_API jsoc_error jsoc_parse_many(const char *input, size_t length,
     return jsoc_error_at_offset(input, length, JSOC_ERR_INVALID_UTF8,
                                 utf8_offset);
   }
+
+  jsoc_document_callback use_cb = callback;
+  void *use_user = user;
+  /* Split fast path: cache-sized stage-1 batches over the whole stream, each
+   * document built by the same split builder `jsoc_parse` uses.  A grammar
+   * failure replays the token path for exact errors, skipping the documents
+   * already delivered. */
+#if JSOC_SIMD_AVX2
+  size_t skip_docs = 0;
+  bool have_skip = false;
+  {
+    const dom_probe probe =
+        (length >= 1024) ? dom_probe_prefix(input, length)
+                         : (dom_probe){length >= 64, true};
+    if (probe.worthwhile) {
+      jsoc_arena *index_arena = jsoc_arena_create(length * 4 + 65536);
+      if (index_arena) {
+        size_t delivered = 0;
+        jsoc_error stop = (jsoc_error)JSOC_ERR_INIT;
+        const bool complete = stream_fast_path(
+            input, length, index_arena, probe.branchless, arena, callback,
+            user, &delivered, &stop);
+        jsoc_arena_destroy(index_arena);
+        if (stop.code != JSOC_OK)
+          return stop;
+        if (complete)
+          return (jsoc_error)JSOC_ERR_INIT;
+        skip_docs = delivered;
+        have_skip = delivered > 0;
+      }
+    }
+  }
+#endif
+
+#if JSOC_SIMD_AVX2
+  stream_skip_ctx skip_ctx;
+  if (have_skip) {
+    skip_ctx = (stream_skip_ctx){callback, user, skip_docs};
+    use_cb = stream_skip_cb;
+    use_user = &skip_ctx;
+  }
+#endif
 
   jsoc_arena *token_arena = jsoc_arena_create(length / 8 + 4096);
   if (JSOC_UNLIKELY(!token_arena)) {
@@ -1080,7 +1311,7 @@ JSOC_API jsoc_error jsoc_parse_many(const char *input, size_t length,
       jsoc_error fatal = (jsoc_error)JSOC_ERR_INIT;
       const jsoc_error delivered =
           stream_run(r.tokens, r.count, input, length, arena, overflow_token,
-                     callback, user, &fatal);
+                     use_cb, use_user, &fatal);
       jsoc_arena_destroy(token_arena);
       if (delivered.code != JSOC_OK) {
         return delivered;
@@ -1098,7 +1329,7 @@ JSOC_API jsoc_error jsoc_parse_many(const char *input, size_t length,
   jsoc_error end_err = (jsoc_error)JSOC_ERR_INIT;
   const jsoc_error result =
       stream_run(r.tokens, r.count - 1, input, length, arena, overflow_token,
-                 callback, user, &end_err);
+                 use_cb, use_user, &end_err);
   /* The tokens live in `token_arena`, which must outlive stream_run but not
    * its return value. */
   jsoc_arena_destroy(token_arena);

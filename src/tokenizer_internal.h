@@ -88,6 +88,33 @@ JSOC_INTERNAL bool jsoc_dom_stage1(const char *input, size_t length,
                                    jsoc_arena *arena, bool branchless,
                                    uint32_t **out_indexes, size_t *out_count);
 
+#if JSOC_SIMD_AVX2
+#include "utf8.h" /* jsoc_utf8_state */
+
+/* State carried between the stage-1 chunks of one input, so a stream can be
+ * scanned as several non-overlapping windows instead of restarting each
+ * window.  `s1.prev_in_string` is the only one that actually changes the
+ * index stream; the UTF-8 state matters only because it is validated while
+ * scanning.  A chunk must therefore end on a UTF-8 character boundary (see
+ * jsoc_dom_stage1_resume) and must not cut a `\u` escape. */
+typedef struct {
+    jsoc_stage1_state s1;
+    jsoc_utf8_state utf8;
+} jsoc_stage1_batch_state;
+
+/* Scan one chunk of a longer input, appending its structural indexes to
+ * `indexes[*count ..]` and keeping the chunk state in `state` for the next
+ * call.  `base_offset` is the absolute offset of `input[0]` in the whole
+ * input, so the emitted indexes are absolute offsets.  `indexes` must have
+ * room for `*count + length + 8` entries.  `check_utf8` may be false when the
+ * whole input was validated separately. */
+JSOC_INTERNAL bool jsoc_dom_stage1_resume(const char *input, size_t length,
+                                         bool branchless, size_t base_offset,
+                                         bool check_utf8, uint32_t *indexes,
+                                         size_t *count,
+                                         jsoc_stage1_batch_state *state);
+#endif /* JSOC_SIMD_AVX2 */
+
 /* True when this build contains the AVX2 stage-1 tokenizer. */
 JSOC_INTERNAL bool jsoc_tokenizer_simd_available(void);
 
