@@ -1893,14 +1893,14 @@ JSOC_INTERNAL bool jsoc_dom_stage1_resume(const char *input, size_t length,
    * literals in every copy and no per-block predicate remains. */
   bool ok;
   if (branchless) {
-    ok = check_utf8 ? stage1_scan_ex(input, length, indexes, true, true, false, true, &seen,
+    ok = check_utf8 ? stage1_scan_ex(input, length, indexes, true, true, false, false, &seen,
                                      base_offset, &st)
-                    : stage1_scan_ex(input, length, indexes, true, false, false, true, &seen,
+                    : stage1_scan_ex(input, length, indexes, true, false, false, false, &seen,
                                      base_offset, &st);
   } else {
-    ok = check_utf8 ? stage1_scan_ex(input, length, indexes, false, true, false, true, &seen,
+    ok = check_utf8 ? stage1_scan_ex(input, length, indexes, false, true, false, false, &seen,
                                      base_offset, &st)
-                    : stage1_scan_ex(input, length, indexes, false, false, false, true,
+                    : stage1_scan_ex(input, length, indexes, false, false, false, false,
                                      &seen, base_offset, &st);
   }
   if (JSOC_UNLIKELY(!ok))
