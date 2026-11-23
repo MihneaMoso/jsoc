@@ -28,7 +28,9 @@ extern "C" {
 #include "jsoc.h"
 #include "decode.h"
 #include "encode.h"
+#include "ondemand.h"
 }
+#include "ondemand.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -555,17 +557,15 @@ static std::vector<Sample> run_typed(int argc, char **argv, int first_arg,
     jsoc_twitter jt{};
     jt.statuses = jstorage;
     jt.status_count = 256;
-    jsoc_document jdoc = jsoc_parse(buf.data(), length, parse_arena);
-    if (jdoc.error.code != JSOC_OK) {
+    jsoc_ondemand jod;
+    jsoc_error jerr;
+    if (!jsoc_ondemand_scan(&jod, buf.data(), length, parse_arena, &jerr)) {
       jsoc_arena_destroy(parse_arena); jsoc_arena_destroy(work_arena);
       continue;
     }
-    jsoc_decode_result dr =
-        jsoc_decode_object(jsoc_twitter_fields, 1, &jdoc, jdoc.root, &jt);
-    if (dr.code != JSOC_DECODE_OK) {
-      std::fprintf(stderr, "%s: jsoc decode: %s (%s)\n", argv[arg],
-                   jsoc_decode_error_message(dr.code),
-                   dr.field_name ? dr.field_name : "?");
+    bool jok = jsoc::od::decode(jod, jt, work_arena);
+    if (!jok) {
+      std::fprintf(stderr, "%s: jsoc decode failed\n", argv[arg]);
       jsoc_arena_destroy(parse_arena); jsoc_arena_destroy(work_arena);
       continue;
     }
@@ -620,10 +620,11 @@ static std::vector<Sample> run_typed(int argc, char **argv, int first_arg,
             jsoc_twitter out{};
             out.statuses = jstorage;
             out.status_count = 256;
-            jsoc_document doc = jsoc_parse(buf.data(), length, work_arena);
-            if (doc.error.code != JSOC_OK) std::abort();
-            if (jsoc_decode_object(jsoc_twitter_fields, 1, &doc, doc.root, &out)
-                    .code != JSOC_DECODE_OK)
+            jsoc_ondemand od;
+            jsoc_error derr;
+            if (!jsoc_ondemand_scan(&od, buf.data(), length, work_arena, &derr))
+              std::abort();
+            if (!jsoc::od::decode(od, out, work_arena))
               std::abort();
           },
           [&] {

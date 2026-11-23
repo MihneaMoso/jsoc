@@ -6,7 +6,16 @@
  */
 
 #include "dom.h"
+#include "export.h"
+#include <stddef.h>
 #include <stdint.h>
+
+/* Decode a raw JSON string body (without the surrounding quotes) into `out`,
+ * which must have room for `length + 1` bytes.  NUL-terminates the result and
+ * stores its length in `*out_len`.  Shared by the DOM string cache and the
+ * on-demand decoder. */
+JSOC_INTERNAL bool jsoc_decode_escaped_string(const char *raw, size_t length,
+                                              char *out, size_t *out_len);
 
 #define JSOC_NO_INDEX UINT32_MAX
 

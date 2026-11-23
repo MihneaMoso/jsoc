@@ -36,7 +36,7 @@ ROOT_DIR    = .
 SOURCES = $(SRC_DIR)/arena.c $(SRC_DIR)/error.c $(SRC_DIR)/token.c \
           $(SRC_DIR)/tokenizer.c $(SRC_DIR)/dom.c $(SRC_DIR)/path.c \
           $(SRC_DIR)/writer.c $(SRC_DIR)/serialize.c $(SRC_DIR)/cursor.c \
-          $(SRC_DIR)/decode.c $(SRC_DIR)/encode.c
+          $(SRC_DIR)/decode.c $(SRC_DIR)/encode.c $(SRC_DIR)/ondemand.c
 OBJECTS = $(SOURCES:$(SRC_DIR)/%.c=$(BUILD_DIR)/%.o)
 DEPS    = $(OBJECTS:.o=.d)
 
@@ -50,9 +50,11 @@ DOM_TEST_SOURCES = $(TEST_DIR)/test_dom.c
 DOM_TEST_BIN     = $(BUILD_DIR)/test_dom
 
 # Suites ported from simdjson's tests/ (one binary per topic).
-TOPIC_TESTS := numbers errors stream pointer minify padding unicode static encode
+TOPIC_TESTS := numbers errors stream pointer minify padding unicode static encode ondemand
 TOPIC_SOURCES = $(addprefix $(TEST_DIR)/test_,$(addsuffix .c,$(TOPIC_TESTS)))
 TOPIC_BINS    = $(addprefix $(BUILD_DIR)/test_,$(TOPIC_TESTS))
+CPP_TEST_SRC  = $(TEST_DIR)/test_ondemand_hpp.cpp
+CPP_TEST_BIN  = $(BUILD_DIR)/test_ondemand_hpp
 
 FUZZ_SOURCES = $(ROOT_DIR)/fuzz/fuzz.c
 FUZZ_BIN     = $(BUILD_DIR)/fuzz
@@ -64,7 +66,7 @@ BENCH_SOURCES = $(BENCH_DIR)/bench.c
 BENCH_BIN     = $(BUILD_DIR)/bench
 
 TARGETS = $(STATIC_LIB) $(SHARED_LIB) $(TEST_BIN) $(DOM_TEST_BIN) \
-          $(TOPIC_BINS) $(CORPUS_BIN) $(BENCH_BIN) $(FUZZ_BIN)
+          $(TOPIC_BINS) $(CPP_TEST_BIN) $(CORPUS_BIN) $(BENCH_BIN) $(FUZZ_BIN)
 
 # Default benchmark inputs (persistent under ~/bench_corpus).
 BENCH_ARGS ?= ~/bench_corpus/twitter.json ~/bench_corpus/citm_catalog.json
@@ -136,6 +138,9 @@ $(CORPUS_BIN): $(CORPUS_SOURCES) $(SRC_DIR)/dom_internal.h $(STATIC_LIB)
 $(BUILD_DIR)/test_%: $(TEST_DIR)/test_%.c test/test.h $(INCLUDE_DIR)/jsoc.h $(STATIC_LIB)
 	$(CC) $(CFLAGS) -I$(TEST_DIR) -I$(SRC_DIR) -o $@ $< $(STATIC_LIB) $(LDFLAGS) $(LDLIBS)
 
+$(CPP_TEST_BIN): $(CPP_TEST_SRC) $(STATIC_LIB)
+	g++ -std=c++26 -freflection $(CFLAGS) -o $@ $< $(STATIC_LIB) $(LDFLAGS) $(LDLIBS)
+
 # The fuzz driver: standalone, deterministic, bounded by FUZZ_ITERS.
 $(FUZZ_BIN): $(FUZZ_SOURCES) $(INCLUDE_DIR)/jsoc.h $(STATIC_LIB)
 	$(CC) $(CFLAGS) -I$(SRC_DIR) -o $@ $< $(STATIC_LIB) $(LDFLAGS) $(LDLIBS)
@@ -151,6 +156,7 @@ test:
 	./$(TEST_BIN)
 	./$(DOM_TEST_BIN)
 	@for t in $(TOPIC_TESTS); do ./$(BUILD_DIR)/test_$$t || exit 1; done
+	./$(CPP_TEST_BIN)
 
 bench:
 	./$(BENCH_BIN) $(BENCH_ARGS)
@@ -178,6 +184,7 @@ check: asan
 	./$(TEST_BIN)
 	./$(DOM_TEST_BIN)
 	@for t in $(TOPIC_TESTS); do ./$(BUILD_DIR)/test_$$t || exit 1; done
+	./$(CPP_TEST_BIN)
 
 install: release
 	install -d $(DESTDIR)/usr/local/include/jsoc

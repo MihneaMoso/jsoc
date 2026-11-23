@@ -88,6 +88,12 @@ JSOC_INTERNAL bool jsoc_dom_stage1(const char *input, size_t length,
                                    jsoc_arena *arena, bool branchless,
                                    uint32_t **out_indexes, size_t *out_count);
 
+/* Compact variant: omits ',' and ':' from the structural index array. */
+JSOC_INTERNAL bool jsoc_dom_stage1_compact(const char *input, size_t length,
+                                           jsoc_arena *arena,
+                                           uint32_t **out_indexes,
+                                           size_t *out_count);
+
 #if JSOC_SIMD_AVX2
 #include "utf8.h" /* jsoc_utf8_state */
 
