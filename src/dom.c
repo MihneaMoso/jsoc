@@ -570,11 +570,17 @@ static dom_probe dom_probe_prefix(const char *input, size_t length) {
 
 /* Build one document from the index stream.  Returns false without setting a
  * final error when the input needs the ordinary path. */
-static bool dom_build_indexed(jsoc_document *doc, const uint32_t *indexes,
-                              size_t count, jsoc_arena *arena) {
+/* Build one document from `indexes[0 .. cap)`.  When `out_end` is non-NULL,
+ * the document may be shorter than `cap`: `*out_end` receives the index
+ * position one past the parsed value, so a caller with an index stream of
+ * concatenated documents can build the next one without a separate walk.
+ * When `out_end` is NULL the whole range must be one document. */
+static bool dom_build_indexed_ex(jsoc_document *doc, const uint32_t *indexes,
+                                 size_t cap, size_t *out_end,
+                                 jsoc_arena *arena) {
 #ifdef JSOC_EXP_S2_WALK
   uint64_t sum = 0;
-  for (size_t i = 0; i < count; i++)
+  for (size_t i = 0; i < cap; i++)
     sum += (unsigned char)doc->input[indexes[i]];
   if (sum == 0xFFFFFFFFu)
     return false;
@@ -585,13 +591,19 @@ static bool dom_build_indexed(jsoc_document *doc, const uint32_t *indexes,
   doc->root = NULL;
   return true;
 #else
-  const size_t value_cap = count / 2 + 2;
-  const size_t member_cap = count / 2 + 2;
+  const size_t value_cap = cap / 2 + 2;
+  const size_t member_cap = cap / 2 + 2;
 
-  doc->values = jsoc_arena_alloc_t(arena, jsoc_value, value_cap);
-  doc->members = jsoc_arena_alloc_t(arena, jsoc_member, member_cap);
-  if (JSOC_UNLIKELY(!doc->values || !doc->members))
+  /* One arena allocation for both arrays: a document is the unit of the
+   * stream fast path, so halving the number of allocations per document is
+   * measurable on small-document NDJSON. */
+  const size_t vbytes = value_cap * sizeof(jsoc_value);
+  unsigned char *block = jsoc_arena_alloc(
+      arena, vbytes + member_cap * sizeof(jsoc_member), _Alignof(uint64_t));
+  if (JSOC_UNLIKELY(!block))
     return false;
+  doc->values = (jsoc_value *)block;
+  doc->members = (jsoc_member *)(block + vbytes);
   doc->value_count = value_cap;
   doc->member_count = member_cap;
   doc->string_cache = NULL;
@@ -602,7 +614,7 @@ static bool dom_build_indexed(jsoc_document *doc, const uint32_t *indexes,
       .indexes = indexes,
       .values = doc->values,
       .members = doc->members,
-      .count = count,
+      .count = cap,
       .pos = 0,
       .doc = doc,
       .next_value = 0,
@@ -613,14 +625,27 @@ static bool dom_build_indexed(jsoc_document *doc, const uint32_t *indexes,
       .fail = false,
   };
   const uint32_t root = idx_parse_value(&b);
-  if (JSOC_UNLIKELY(b.fail || root == JSOC_NO_INDEX || b.pos != count))
+  if (JSOC_UNLIKELY(b.fail || root == JSOC_NO_INDEX))
     return false;
+  if (out_end) {
+    if (b.pos == 0)
+      return false;
+    *out_end = b.pos;
+  } else if (JSOC_UNLIKELY(b.pos != cap)) {
+    return false;
+  }
 
   doc->value_count = b.next_value;
   doc->member_count = b.next_member;
   doc->root = &doc->values[root];
   return true;
 #endif
+}
+
+static inline bool dom_build_indexed(jsoc_document *doc,
+                                     const uint32_t *indexes, size_t count,
+                                     jsoc_arena *arena) {
+  return dom_build_indexed_ex(doc, indexes, count, NULL, arena);
 }
 #endif /* JSOC_SIMD_AVX2 */
 
@@ -1008,8 +1033,13 @@ static inline bool dom_is_ws(unsigned char c) {
  * document fits in one pass (a retry re-scans the whole window), small enough
  * that a batch's index stream stays close to the cache. */
 #ifndef JSOC_STREAM_BATCH
-#define JSOC_STREAM_BATCH (65536u)
+#define JSOC_STREAM_BATCH (131072u)
 #endif
+
+/* Try to build a document with at most this many indexes in one pass.  Small
+ * NDJSON documents fit, so we avoid the separate boundary-detection walk;
+ * larger documents fall back to walking the index range first. */
+#define JSOC_STREAM_FUSED_CAP 512u
 
 /* Run the split path over the whole stream, one cache-sized batch at a time.
  *
@@ -1032,8 +1062,9 @@ static bool stream_fast_path(const char *input, size_t length,
   /* One index per token start: a token is at least one byte, so the whole
    * stream can never produce more than `length` indexes.  The arena only
    * commits the pages actually written. */
+  const size_t index_entries = JSOC_STREAM_BATCH + (1u << 16) + 64;
   uint32_t *indexes = jsoc_arena_alloc(index_arena,
-                                       (length + 64) * sizeof(uint32_t),
+                                       index_entries * sizeof(uint32_t),
                                        _Alignof(uint32_t));
   if (JSOC_UNLIKELY(!indexes))
     return false;
@@ -1086,6 +1117,49 @@ static bool stream_fast_path(const char *input, size_t length,
     for (;;) {
       const size_t doc_start = pending ? pos : scan;
       size_t end_idx;
+      bool fused_ok = false;
+      if (!pending) {
+        /* Fast path: let the builder parse one value and report its end, so
+         * the index stream is walked only once.  A scalar that ends the
+         * window cannot be proven complete, so defer it as before. */
+        const unsigned char first = (unsigned char)input[indexes[scan]];
+        const bool maybe_scalar =
+            first != '{' && first != '[' && first != '"';
+        const size_t avail = count - scan;
+        if (!(maybe_scalar && scan + 1 >= count && !final)) {
+          const size_t fcap = avail < JSOC_STREAM_FUSED_CAP
+                                  ? avail
+                                  : JSOC_STREAM_FUSED_CAP;
+          jsoc_arena_reset(arena);
+          jsoc_document fdoc;
+          /* All fields are assigned below / in dom_build_indexed_ex. */
+          fdoc.error = (jsoc_error)JSOC_ERR_INIT;
+          fdoc.input = input;
+          fdoc.length = length;
+          fdoc.arena = arena;
+          size_t fend = 0;
+          if (dom_build_indexed_ex(&fdoc, indexes + scan, fcap, &fend,
+                                   arena)) {
+            if (callback && !callback(&fdoc, user)) {
+              *stop = (jsoc_error){JSOC_ERR_USER_STOP, 0, 0, 0};
+              return true;
+            }
+            (*delivered)++;
+            scan += fend;
+            pos = scan;
+            fused_ok = true;
+          } else {
+            /* Oversized doc: the conservative arena reset may have grown
+             * the arena, but state is intact; use the two-pass path. */
+            jsoc_arena_reset(arena);
+          }
+        }
+      }
+      if (fused_ok) {
+        if (scan >= count)
+          break;
+        continue;
+      }
       if (!pending) {
         const unsigned char first = (unsigned char)input[indexes[scan]];
         if (first == '{' || first == '[') {
@@ -1241,7 +1315,11 @@ JSOC_API jsoc_error jsoc_parse_many(const char *input, size_t length,
         (length >= 1024) ? dom_probe_prefix(input, length)
                          : (dom_probe){length >= 64, true};
     if (probe.worthwhile) {
-      jsoc_arena *index_arena = jsoc_arena_create(length * 4 + 65536);
+      /* Only one window of indexes is live at a time (the stream compacts
+       * consumed documents), so the index arena needs room for a window
+       * plus one oversized document rather than the whole input. */
+      const size_t index_cap = JSOC_STREAM_BATCH + (1u << 16);
+      jsoc_arena *index_arena = jsoc_arena_create(index_cap * 4 + 65536);
       if (index_arena) {
         size_t delivered = 0;
         jsoc_error stop = (jsoc_error)JSOC_ERR_INIT;
