@@ -80,7 +80,7 @@ FUZZ_TARGET ?= all
 FUZZ_SEED ?= 1
 
 .PHONY: all clean test bench install uninstall debug release release-native \
-        asan asan-native tsan ubsan format check size compare-serialization FORCE
+        asan asan-native tsan ubsan format check size compare-serialization compare-extended FORCE
 
 all: release
 
@@ -166,6 +166,10 @@ bench:
 # (or pkg-config simdjson).
 compare-serialization:
 	$(BENCH_DIR)/compare_serialization.sh $(BENCH_SER_ARGS)
+
+# Extended comparison: nativejson-benchmark + simdjson benchmark shapes.
+compare-extended:
+	$(BENCH_DIR)/compare_extended.sh $(BENCH_SER_ARGS)
 
 # Acceptance corpora.  Fetch them first (`make fetch-testdata`) or pass
 # CORPUS_ARGS explicitly (quote it: make reads every word as a target).
