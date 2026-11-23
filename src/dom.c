@@ -8,6 +8,11 @@
 #include "utf8.h"
 
 #include <stdio.h>
+
+/* flags bits for inline-cached integer numbers */
+#define JSOC_VF_ESCAPED_KEYS 0x04u
+#define JSOC_VF_NUM_VALID 0x01u
+#define JSOC_VF_NUM_NEG   0x02u
 #include <string.h>
 
 /* Max indexes a single fused document build may consume in the stream path. */
@@ -606,14 +611,20 @@ static bool dom_build_indexed_ex(jsoc_document *doc, const uint32_t *indexes,
       value_cap <= JSOC_STREAM_FUSED_CAP / 2 + 2) {
     doc->values = pre_values;
     doc->members = pre_members;
+    doc->num_cache = (int64_t *)pre_members +
+                     (JSOC_STREAM_FUSED_CAP / 2 + 2);
   } else {
     const size_t vbytes = value_cap * sizeof(jsoc_value);
+    const size_t cbytes = value_cap * sizeof(int64_t);
     unsigned char *block = jsoc_arena_alloc(
-        arena, vbytes + member_cap * sizeof(jsoc_member), _Alignof(uint64_t));
+        arena, vbytes + member_cap * sizeof(jsoc_member) + cbytes,
+        _Alignof(uint64_t));
     if (JSOC_UNLIKELY(!block))
       return false;
     doc->values = (jsoc_value *)block;
     doc->members = (jsoc_member *)(block + vbytes);
+    doc->num_cache = (int64_t *)(block + vbytes +
+                                 member_cap * sizeof(jsoc_member));
   }
   doc->value_count = value_cap;
   doc->member_count = member_cap;
@@ -679,7 +690,8 @@ static bool dom_build_document(jsoc_document *doc, const jsoc_token *tokens,
 
   doc->values = jsoc_arena_alloc_t(arena, jsoc_value, value_cap);
   doc->members = jsoc_arena_alloc_t(arena, jsoc_member, member_cap);
-  if (JSOC_UNLIKELY(!doc->values || !doc->members)) {
+  doc->num_cache = jsoc_arena_alloc_t(arena, int64_t, value_cap);
+  if (JSOC_UNLIKELY(!doc->values || !doc->members || !doc->num_cache)) {
     doc->error = (jsoc_error){JSOC_ERR_NOMEM, 0, 0, 0};
     return false;
   }
@@ -1223,7 +1235,8 @@ static bool stream_fast_path(const char *input, size_t length,
   const size_t shared_cap = JSOC_STREAM_FUSED_CAP / 2 + 2;
   jsoc_value *shared_values = jsoc_arena_alloc_t(arena, jsoc_value, shared_cap);
   jsoc_member *shared_members = jsoc_arena_alloc_t(arena, jsoc_member, shared_cap);
-  if (JSOC_UNLIKELY(!shared_values || !shared_members))
+  int64_t *shared_cache = jsoc_arena_alloc_t(arena, int64_t, shared_cap);
+  if (JSOC_UNLIKELY(!shared_values || !shared_members || !shared_cache))
     return false;
   const size_t shared_mark = arena->offset;
 
@@ -1761,69 +1774,81 @@ static bool number_lexeme(const jsoc_document *doc, const jsoc_value *v,
   return true;
 }
 
+/* Return the cached integer magnitude and sign, if this lexeme was a plain
+ * integer.  Otherwise fall back to the full validator/parser. */
+static bool number_int_parts(const jsoc_document *doc, const jsoc_value *v,
+                             bool *negative, uint64_t *mag) {
+  if (!doc || !v || v->type != JSOC_VALUE_NUMBER)
+    return false;
+  if (v->flags & JSOC_VF_NUM_VALID) {
+    const int64_t c = doc->num_cache[v - doc->values];
+    *negative = c < 0;
+    *mag = (uint64_t)(c < 0 ? -c : c);
+    return true;
+  }
+  const char *p = doc->input + v->offset;
+  const size_t n = v->length;
+  if (!jsoc_number_is_integer(p, n) ||
+      !jsoc_number_integer_magnitude(p, n, negative, mag))
+    return false;
+  /* Memoise on first access; later accesses are a single load. */
+  const bool fits = *negative ? *mag <= (uint64_t)INT64_MAX + 1u
+                              : *mag <= (uint64_t)INT64_MAX;
+  if (doc->num_cache && fits && !(*negative && *mag == 0)) {
+    doc->num_cache[v - doc->values] =
+        *negative ? (*mag == (uint64_t)INT64_MAX + 1u
+                         ? INT64_MIN
+                         : -(int64_t)*mag)
+                  : (int64_t)*mag;
+    ((jsoc_value *)v)->flags |= JSOC_VF_NUM_VALID;
+  }
+  return true;
+}
+
 JSOC_API bool jsoc_value_is_integer(const jsoc_document *doc,
                                     const jsoc_value *v) {
-  const char *p;
-  size_t n;
-  if (!number_lexeme(doc, v, &p, &n))
-    return false;
-  return jsoc_number_is_integer(p, n);
+  if (!doc || !v || v->type != JSOC_VALUE_NUMBER) return false;
+  if (v->flags & JSOC_VF_NUM_VALID) return true;
+  const char *p = doc->input + v->offset;
+  return jsoc_number_is_integer(p, v->length);
 }
 
 JSOC_API bool jsoc_value_get_int64(const jsoc_document *doc,
                                    const jsoc_value *v, int64_t *out) {
-  if (out)
-    *out = 0;
-  const char *p;
-  size_t n;
-  if (!number_lexeme(doc, v, &p, &n) || !jsoc_number_is_integer(p, n))
-    return false;
+  if (out) *out = 0;
   bool negative;
   uint64_t mag;
-  if (!jsoc_number_integer_magnitude(p, n, &negative, &mag))
-    return false;
+  if (!number_int_parts(doc, v, &negative, &mag)) return false;
   if (negative) {
-    if (mag > ((uint64_t)INT64_MAX + 1u))
-      return false;
-    if (out)
-      *out = (mag == ((uint64_t)INT64_MAX + 1u)) ? INT64_MIN : -(int64_t)mag;
+    if (mag > (uint64_t)INT64_MAX + 1u) return false;
+    if (out) *out = (mag == (uint64_t)INT64_MAX + 1u) ? INT64_MIN : -(int64_t)mag;
     return true;
   }
-  if (mag > (uint64_t)INT64_MAX)
-    return false;
-  if (out)
-    *out = (int64_t)mag;
+  if (mag > (uint64_t)INT64_MAX) return false;
+  if (out) *out = (int64_t)mag;
   return true;
 }
 
 JSOC_API bool jsoc_value_get_uint64(const jsoc_document *doc,
                                     const jsoc_value *v, uint64_t *out) {
-  if (out)
-    *out = 0;
-  const char *p;
-  size_t n;
-  if (!number_lexeme(doc, v, &p, &n) || !jsoc_number_is_integer(p, n))
-    return false;
+  if (out) *out = 0;
   bool negative;
   uint64_t mag;
-  if (!jsoc_number_integer_magnitude(p, n, &negative, &mag))
-    return false;
-  if (negative && mag != 0)
-    return false;
-  if (out)
-    *out = mag;
+  if (!number_int_parts(doc, v, &negative, &mag)) return false;
+  if (negative && mag != 0) return false;
+  if (out) *out = mag;
   return true;
 }
 
 JSOC_API bool jsoc_value_get_double(const jsoc_document *doc,
                                     const jsoc_value *v, double *out) {
-  if (out)
-    *out = 0.0;
-  const char *p;
-  size_t n;
-  if (!number_lexeme(doc, v, &p, &n))
-    return false;
-  return jsoc_lexeme_to_double(doc->arena, p, n, out);
+  if (out) *out = 0.0;
+  if (!doc || !v || v->type != JSOC_VALUE_NUMBER) return false;
+  if (v->flags & JSOC_VF_NUM_VALID) {
+    if (out) *out = (double)doc->num_cache[v - doc->values];
+    return true;
+  }
+  return jsoc_lexeme_to_double(doc->arena, doc->input + v->offset, v->length, out);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -1862,29 +1887,32 @@ static const jsoc_value *object_find(const jsoc_document *doc,
                                      size_t key_len) {
   if (!doc || !v || v->type != JSOC_VALUE_OBJECT)
     return NULL;
+  /* Pass 1: compare raw key slices.  Almost all keys are escape-free, so
+   * this is a single length check + memcmp per member with no allocation. */
   uint32_t m = v->first;
-  while (m != JSOC_NO_INDEX) {
+  for (; m != JSOC_NO_INDEX; m = doc->members[m].next) {
+    const jsoc_member *member = &doc->members[m];
+    if (member->key_length == key_len &&
+        memcmp(doc->input + member->key_offset, key, key_len) == 0) {
+      /* A raw match can only come from an escape-free key (an escaped spelling
+       * contains a backslash the caller's logical key does not). */
+      if (memchr(doc->input + member->key_offset, '\\', key_len) == NULL)
+        return &doc->values[member->value];
+      break;
+    }
+  }
+  /* Pass 2: a logical key can differ from its escaped raw form.  Only walk
+   * escaped members, and only when the cheap pass found nothing. */
+  for (m = v->first; m != JSOC_NO_INDEX; m = doc->members[m].next) {
     const jsoc_member *member = &doc->members[m];
     const char *mk = doc->input + member->key_offset;
-    const bool escaped = memchr(mk, '\\', member->key_length) != NULL;
-    /* Fast path: escape-free key, compared against the raw slice.  A key
-     * that contains a backslash must never match the caller's escaped
-     * spelling; the logical key is what is being looked up. */
-    if (!escaped && member->key_length == key_len &&
-        memcmp(mk, key, key_len) == 0) {
+    if (memchr(mk, '\\', member->key_length) == NULL) continue;
+    jsoc_string decoded =
+        dom_cached_decode((jsoc_document *)doc, doc->value_count + (size_t)m,
+                          member->key_offset, member->key_length);
+    if (decoded.data != NULL && decoded.length == key_len &&
+        memcmp(decoded.data, key, key_len) == 0)
       return &doc->values[member->value];
-    }
-    /* Slow path: decode only keys that actually contain escapes. */
-    if (escaped) {
-      jsoc_string decoded =
-          dom_cached_decode((jsoc_document *)doc, doc->value_count + (size_t)m,
-                            member->key_offset, member->key_length);
-      if (decoded.data != NULL && decoded.length == key_len &&
-          memcmp(decoded.data, key, key_len) == 0) {
-        return &doc->values[member->value];
-      }
-    }
-    m = member->next;
   }
   return NULL;
 }

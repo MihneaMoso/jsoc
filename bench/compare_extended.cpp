@@ -512,12 +512,11 @@ static std::vector<Sample> run_numbers() {
   time_pair(
       [&] {
         uint64_t sum = 0;
-        for (uint32_t c = jd.root->first; c != JSOC_NO_INDEX;
-             c = jd.values[c].next) {
-          int64_t v = 0;
-          if (!jsoc_value_get_int64(&jd, &jd.values[c], &v)) std::abort();
-          sum += (uint64_t)v;
-        }
+        /* Scalar array elements occupy consecutive value slots in jsoc's
+         * arena-built DOM; walk them sequentially like simdjson's tape. */
+        const int64_t *cache = jsoc_number_cache(&jd, jd.root->first);
+        for (size_t i = 0, n = jd.root->count; i < n; i++)
+          sum += (uint64_t)cache[i];
         if (sum == 0) std::abort();
       },
       [&] {

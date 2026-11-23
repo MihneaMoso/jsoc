@@ -19,6 +19,10 @@ JSOC_INTERNAL bool jsoc_decode_escaped_string(const char *raw, size_t length,
 
 #define JSOC_NO_INDEX UINT32_MAX
 
+/* jsoc_value.flags bits for the inline-cached integer magnitude. */
+#define JSOC_VF_NUM_VALID 0x01u
+#define JSOC_VF_NUM_NEG   0x02u
+
 struct jsoc_value {
     union {
         struct {

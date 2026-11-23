@@ -60,6 +60,7 @@ typedef struct {
   jsoc_member *members;
   size_t member_count;
   void *string_cache;
+  int64_t *num_cache;  /* parsed signed integers, parallel to `values` */
 } jsoc_document;
 
 /* Parse one JSON document.  Trailing non-whitespace is an error. */
@@ -122,6 +123,21 @@ JSOC_API bool jsoc_value_is_integer(const jsoc_document *doc,
                                     const jsoc_value *v) JSOC_PURE;
 
 /* --- Arrays -------------------------------------------------------------- */
+
+/* Fast bulk accessor for arrays of numbers.  jsoc parses integer lexemes once
+ * into a parallel cache at parse time; this returns the value at `value_index`
+ * (a slot in the document's value array) without re-parsing or a function
+ * call.  Intended for numeric arrays produced by jsoc_parse. */
+static inline int64_t jsoc_number_at(const jsoc_document *doc,
+                                     uint32_t value_index) {
+  return doc->num_cache[value_index];
+}
+
+/* Pointer into the numeric cache at a value slot, for tight numeric loops. */
+static inline const int64_t *jsoc_number_cache(const jsoc_document *doc,
+                                               uint32_t value_index) {
+  return doc->num_cache + value_index;
+}
 
 JSOC_API size_t jsoc_array_size(const jsoc_document *doc, const jsoc_value *v);
 JSOC_API const jsoc_value *jsoc_array_at(const jsoc_document *doc,
